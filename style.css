@@ -7346,8 +7346,9 @@ body[class*="theme-"] #filterDrawer .form-select.searchbox-select.drawer-select.
   justify-content: center;
   gap: 14px;
   padding: 24px 16px calc(24px + env(safe-area-inset-bottom));
-  background: var(--bg-color, #f9fafe);
-  color: var(--text-color, #242943);
+  /* テーマ（ブラック・レッドなど）に関係なく、いつも白地に濃い文字（ホワイトテーマと同じ色） */
+  background: #f9fafe;
+  color: #242943;
   text-align: center;
   font-family: fot-udkakugoc80-pro, 'Segoe UI', system-ui, -apple-system, sans-serif;
 }
@@ -7366,7 +7367,7 @@ html.is-maintenance #loading-screen { display: none !important; }
   font-size: 1.75rem;
   font-weight: 700;
   letter-spacing: 0.06em;
-  color: var(--text-color, #242943);
+  color: #242943;
 }
 #maintenance-screen .maint-msg {
   margin: 0;
@@ -7374,5 +7375,5 @@ html.is-maintenance #loading-screen { display: none !important; }
   font-weight: 700;
   line-height: 1.8;
   white-space: pre-line; /* maintenance.json の \n で改行 */
-  color: var(--text-color, #242943);
+  color: #242943;
 }
