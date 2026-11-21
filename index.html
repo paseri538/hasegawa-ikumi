@@ -219,36 +219,53 @@
 <script>
   (function () {
     var el = document.getElementById('maintenance-screen');
-    /* 管理人の確認用に出さない場合: 編集ツールのプレビュー（枠の中・?preview=1・/admin/preview/）と、
-       URLに ?maintenance=off を付けて開いたタブ（閉じるまで） */
     var q = location.search;
-    var bypass = location.pathname.indexOf('/admin/preview/') !== -1 || /[?&]preview=1(&|$)/.test(q);
-    try { if (window.self !== window.top) bypass = true; } catch (e) { bypass = true; }
-    try {
-      if (/[?&]maintenance=off(&|$)/.test(q)) sessionStorage.setItem('maintenance_bypass_v1', '1');
-      if (sessionStorage.getItem('maintenance_bypass_v1') === '1') bypass = true;
-    } catch (e) {}
-    if (bypass) return;
+    /* 編集ツールの見本: オン／オフに関係なく、この画面だけを出す。
+       ?maintenance=preview か、枠の名前が maintenance-sample のとき（サイトがURLを書き換えて読み直しても見本のまま） */
+    var sample = /[?&]maintenance=preview(&|$)/.test(q) || window.name === 'maintenance-sample';
+    if (!sample) {
+      /* 管理人の確認用に出さない場合: 編集ツールのプレビュー（枠の中・?preview=1・/admin/preview/）と、
+         URLに ?maintenance=off を付けて開いたタブ（閉じるまで） */
+      var bypass = location.pathname.indexOf('/admin/preview/') !== -1 || /[?&]preview=1(&|$)/.test(q);
+      try { if (window.self !== window.top) bypass = true; } catch (e) { bypass = true; }
+      try {
+        if (/[?&]maintenance=off(&|$)/.test(q)) sessionStorage.setItem('maintenance_bypass_v1', '1');
+        if (sessionStorage.getItem('maintenance_bypass_v1') === '1') bypass = true;
+      } catch (e) {}
+      if (bypass) return;
+    }
     fetch('maintenance.json', { cache: 'no-store' })
       .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; })
       .then(function (m) {
-        if (!m || m.on !== true) return;
+        if (!sample && (!m || m.on !== true)) return;
+        m = m || {};
         var show = function () {
           /* 「スマホで見る」（保存前の内容のプレビュー）にも出さない */
-          if (document.querySelector('script[src*="__phone"]')) return;
+          if (!sample && document.querySelector('script[src*="__phone"]')) return;
           var msg = typeof m.message === 'string' && m.message.trim() ? m.message : 'ただいまメンテナンス中です。';
           document.getElementById('maintenanceMsg').textContent = msg;
+          if (typeof m.title === 'string' && m.title.trim()) el.querySelector('.maint-title').textContent = m.title;
           el.hidden = false;
           document.documentElement.classList.add('is-maintenance');
           /* 裏のページにはフォーカス・読み上げが届かないようにする */
           Array.prototype.forEach.call(document.body.children, function (c) {
             if (c !== el && c.tagName !== 'SCRIPT') c.setAttribute('inert', '');
           });
+          if (sample) return;
+          /* 解除されたら、開いたままの人も自動で元のサイトに戻す（1分ごと＋タブに戻ってきたときに確かめる） */
+          var check = function () {
+            fetch('maintenance.json', { cache: 'no-store' })
+              .then(function (r) { return r.ok ? r.json() : null; })
+              .then(function (n) { if (n && n.on !== true) location.reload(); })
+              .catch(function () {});
+          };
+          setInterval(check, 60000);
+          document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') check(); });
         };
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show);
         else show();
-      })
-      .catch(function () {});
+      });
   })();
 </script>
 

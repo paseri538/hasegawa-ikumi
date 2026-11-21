@@ -2,7 +2,7 @@
 // サイトを更新してアップするときは、この値を毎回別の文字列に書き換えること（例: 日付＋英字）。
 // 値が変わると次回アクセス時に全ファイルが新しいキャッシュへ一括で取り直され、
 // 自動リロードで新バージョンが反映される（古いキャッシュは自動削除）。
-const SW_VERSION = '20261121a';
+const SW_VERSION = '20261122a';
 // searchtheradio.com の下に2つのサイト（/bocchi-radio/ と /hasegawa-ikumi/）が並ぶので、
 // キャッシュの名前をサイトごとに分け、片付けるときも自分の分だけ消す（/bocchi-radio/ の分は消さない）。
 const CACHE_PREFIX = 'hasegawa-ikumi-cache-';
