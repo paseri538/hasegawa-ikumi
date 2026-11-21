@@ -210,6 +210,48 @@
   requestAnimationFrame(function () { window.__loadingShownAt = performance.now(); });
 </script>
 
+<!-- メンテナンス画面: maintenance.json の on が true のとき、サイト全体を覆って出す（編集ツールの「メンテナンス画面」ボタンでオン／オフ） -->
+<div id="maintenance-screen" hidden>
+  <img src="logo.webp" alt="長谷川育美非公式サイト(検)" class="maint-logo" decoding="async">
+  <h1 class="maint-title">メンテナンス中</h1>
+  <p class="maint-msg" id="maintenanceMsg"></p>
+</div>
+<script>
+  (function () {
+    var el = document.getElementById('maintenance-screen');
+    /* 管理人の確認用に出さない場合: 編集ツールのプレビュー（枠の中・?preview=1・/admin/preview/）と、
+       URLに ?maintenance=off を付けて開いたタブ（閉じるまで） */
+    var q = location.search;
+    var bypass = location.pathname.indexOf('/admin/preview/') !== -1 || /[?&]preview=1(&|$)/.test(q);
+    try { if (window.self !== window.top) bypass = true; } catch (e) { bypass = true; }
+    try {
+      if (/[?&]maintenance=off(&|$)/.test(q)) sessionStorage.setItem('maintenance_bypass_v1', '1');
+      if (sessionStorage.getItem('maintenance_bypass_v1') === '1') bypass = true;
+    } catch (e) {}
+    if (bypass) return;
+    fetch('maintenance.json', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (m) {
+        if (!m || m.on !== true) return;
+        var show = function () {
+          /* 「スマホで見る」（保存前の内容のプレビュー）にも出さない */
+          if (document.querySelector('script[src*="__phone"]')) return;
+          var msg = typeof m.message === 'string' && m.message.trim() ? m.message : 'ただいまメンテナンス中です。';
+          document.getElementById('maintenanceMsg').textContent = msg;
+          el.hidden = false;
+          document.documentElement.classList.add('is-maintenance');
+          /* 裏のページにはフォーカス・読み上げが届かないようにする */
+          Array.prototype.forEach.call(document.body.children, function (c) {
+            if (c !== el && c.tagName !== 'SCRIPT') c.setAttribute('inert', '');
+          });
+        };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show);
+        else show();
+      })
+      .catch(function () {});
+  })();
+</script>
+
 
 
 <button id="theme-toggle-btn" aria-label="テーマ切替"><i class="fa-solid fa-palette"></i></button>
