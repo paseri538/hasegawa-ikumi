@@ -1,22 +1,31 @@
-// キャッシュの名前を定義。バージョンを更新すると古いキャッシュは自動的に削除。
-const SW_VERSION = '20260422a'; // ★バージョンを更新
-const CACHE_NAME = `radio-cache-${SW_VERSION}`;
+// ★★★ バージョン表記（サイト全体で唯一） ★★★
+// サイトを更新してアップするときは、この値を毎回別の文字列に書き換えること（例: 日付＋英字）。
+// 値が変わると次回アクセス時に全ファイルが新しいキャッシュへ一括で取り直され、
+// 自動リロードで新バージョンが反映される（古いキャッシュは自動削除）。
+const SW_VERSION = '20261121a';
+// searchtheradio.com の下に2つのサイト（/bocchi-radio/ と /hasegawa-ikumi/）が並ぶので、
+// キャッシュの名前をサイトごとに分け、片付けるときも自分の分だけ消す（/bocchi-radio/ の分は消さない）。
+const CACHE_PREFIX = 'hasegawa-ikumi-cache-';
+const CACHE_NAME = `${CACHE_PREFIX}${SW_VERSION}`;
 
 
 // キャッシュするファイルのリスト
 const CORE_ASSETS = [
-  '/',
+  './',
   'index.html',
   'style.css',
   'main.js',
   'episodes.json',
   'readings.json',
   'keywords.json',
+  'related.json',
   'history.json',
   'photomemory.json',
   'dokokara.json',
   'onshot.json',
-  'logo.png',
+  'logo.webp',
+  'thumb-fallback.svg',
+  'Impact.ttf',
   'favicon.ico',
   'apple-touch-icon.png',
   'site.webmanifest',
@@ -24,120 +33,80 @@ const CORE_ASSETS = [
   'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css'
 ];
 
-// 【重要】ここに、ローカルの全サムネイル画像のパス（.jpg のみ）を貼り付けます
-const THUMBNAIL_ASSETS = [
-  'thumbnails/お手元1.jpg',
-  'thumbnails/お手元2.jpg',
-  'thumbnails/お手元3.jpg',
-  'thumbnails/お手元4.jpg',
-
-  'thumbnails/89.jpg',
-  'thumbnails/88.jpg',
-  'thumbnails/87.jpg',
-  'thumbnails/86.jpg',
-  'thumbnails/85.jpg',
-  'thumbnails/84.jpg',
-  'thumbnails/83.jpg',
-  'thumbnails/82.jpg',
-  'thumbnails/81.jpg',
-  'thumbnails/80.jpg',
-  'thumbnails/79.jpg',
-  'thumbnails/78.jpg',
-  'thumbnails/77.jpg',
-  'thumbnails/76.jpg',
-  'thumbnails/75.jpg',
-  'thumbnails/74.jpg',
-  'thumbnails/73.jpg',
-  'thumbnails/72.jpg',
-  'thumbnails/71.jpg',
-  'thumbnails/70.jpg',
-  'thumbnails/69.jpg',
-  'thumbnails/68.jpg',
-  'thumbnails/67.jpg',
-  'thumbnails/66.jpg',
-  'thumbnails/65.jpg',
-  'thumbnails/64.jpg',
-  'thumbnails/63.jpg',
-  'thumbnails/62.jpg',
-  'thumbnails/61.jpg',
-  'thumbnails/60.jpg',
-  'thumbnails/59.jpg',
-  'thumbnails/58.jpg',
-  'thumbnails/57.jpg',
-  'thumbnails/56.jpg',
-  'thumbnails/55.jpg',
-  'thumbnails/54.jpg',
-  'thumbnails/53.jpg',
-  'thumbnails/52.jpg',
-  'thumbnails/51.jpg',
-  'thumbnails/50.jpg',
-  'thumbnails/49.jpg',
-  'thumbnails/48.jpg',
-  'thumbnails/47.jpg',
-  'thumbnails/46.jpg',
-  'thumbnails/45.jpg',
-  'thumbnails/44.jpg',
-  'thumbnails/43.jpg',
-  'thumbnails/42.jpg',
-  'thumbnails/41.jpg',
-  'thumbnails/40.jpg',
-  'thumbnails/39.jpg',
-  'thumbnails/38.jpg',
-  'thumbnails/37.jpg',
-  'thumbnails/36.jpg',
-  'thumbnails/35.jpg',
-  'thumbnails/34.jpg',
-  'thumbnails/33.jpg',
-  'thumbnails/32.jpg',
-  'thumbnails/31.jpg',
-  'thumbnails/30.jpg',
-  'thumbnails/29.jpg',
-  'thumbnails/28.jpg',
-  'thumbnails/27.jpg',
-  'thumbnails/26.jpg',
-  'thumbnails/25.jpg',
-  'thumbnails/24.jpg',
-  'thumbnails/23.jpg',
-  'thumbnails/22.jpg',
-  'thumbnails/21.jpg',
-  'thumbnails/20.jpg',
-  'thumbnails/19.jpg',
-  'thumbnails/18.jpg',
-  'thumbnails/17.jpg',
-  'thumbnails/16.jpg',
-  'thumbnails/15.jpg',
-  'thumbnails/14.jpg',
-  'thumbnails/13.jpg',
-  'thumbnails/12.jpg',
-  'thumbnails/11.jpg',
-  'thumbnails/10.jpg',
-  'thumbnails/9.jpg',
-  'thumbnails/8.jpg',
-  'thumbnails/7.jpg',
-  'thumbnails/6.jpg',
-  'thumbnails/5.jpg',
-  'thumbnails/4.jpg',
-  'thumbnails/3.jpg',
-  'thumbnails/2.jpg',
-  'thumbnails/1.jpg'
-];
-
-// インストール時にキャッシュする全アセット
-const PRECACHE_ASSETS = [...CORE_ASSETS, ...THUMBNAIL_ASSETS];
-
-
+// サムネイル画像の一覧は episodes.json から動的に生成する。
+// （エピソード追加時にこのファイルを手で更新する必要がない。
+//   カードの画像パスも main.js が同じ `thumbnails/{episode}.jpg` 規則で組み立てている）
+async function getThumbnailAssets() {
+  try {
+    const res = await fetch('episodes.json', { cache: 'no-cache' });
+    if (!res.ok) return [];
+    const episodes = await res.json();
+    const names = episodes.map(ep => ep && ep.episode).filter(Boolean);
+    return [...new Set(names)].map(name => `thumbnails/${name}.jpg`);
+  } catch (e) {
+    console.warn('[SW] Failed to build thumbnail list from episodes.json:', e);
+    return [];
+  }
+}
 
 // 1. Service Workerのインストール処理
 self.addEventListener('install', (event) => {
   console.log('[SW] Install event');
   self.skipWaiting();
-  event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) => {
-      console.log('[SW] Caching core assets');
-      return cache.addAll(PRECACHE_ASSETS);
-    })
-  );
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    console.log('[SW] Caching core assets');
+    // ★cache:'reload' でブラウザのHTTPキャッシュを介さず必ずネットワークから取得する。
+    // （ページ側のURLから ?v= を廃止したため、ここで鮮度を保証しないと
+    //   古いHTTPキャッシュがそのまま新バージョンのキャッシュに入る恐れがある）
+    await cache.addAll(CORE_ASSETS.map(url => new Request(url, { cache: 'reload' })));
+
+    const thumbs = await getThumbnailAssets();
+
+    // サムネイルは内容が変わらないため、旧バージョンのキャッシュから使い回す。
+    // （これがないとSW更新のたびに全サムネイル約8MBを再ダウンロードしてしまう）
+    const oldKeys = (await caches.keys()).filter(key => key !== CACHE_NAME && key.startsWith(CACHE_PREFIX));
+    for (const key of oldKeys) {
+      const oldCache = await caches.open(key);
+      for (const url of thumbs) {
+        if (await cache.match(url)) continue;
+        const oldRes = await oldCache.match(url);
+        if (oldRes) await cache.put(url, oldRes);
+      }
+    }
+
+    // ★変更: 不足分のネットワーク取得はインストール時には行わない。
+    // 初回訪問時に約100枚を一斉ダウンロードすると、ページ本体の描画と
+    // 帯域・CPUを奪い合ってローディングアニメーションがカクつくため、
+    // ページ側が描画完了後に送る 'PRECACHE_THUMBS' メッセージで実行する。
+    console.log('[SW] Install done (thumbnail fetch deferred until page settles)');
+  })());
 });
+
+// 不足しているサムネイルをネットワークから取得してキャッシュする。
+// ページ描画が落ち着いた頃（index.htmlが遅延送信するメッセージ）に呼ばれる。
+async function precacheMissingThumbnails() {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const thumbs = await getThumbnailAssets();
+    const missing = [];
+    for (const url of thumbs) {
+      if (!(await cache.match(url))) missing.push(url);
+    }
+    if (missing.length === 0) return;
+    // 帯域を占有しないよう4件ずつ順番に取得する。
+    // （1件の404で全体を止めないため cache.add の失敗は無視して続行）
+    let failed = 0;
+    for (let i = 0; i < missing.length; i += 4) {
+      const batch = missing.slice(i, i + 4).map(url => cache.add(url));
+      const results = await Promise.allSettled(batch);
+      failed += results.filter(r => r.status === 'rejected').length;
+    }
+    console.log(`[SW] Thumbnails: ${missing.length - failed} fetched, ${failed} failed`);
+  } catch (e) {
+    console.warn('[SW] Thumbnail precache failed:', e);
+  }
+}
 
 // 2. Service Workerの有効化処理
 self.addEventListener('activate', (event) => {
@@ -145,7 +114,8 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) => {
       return Promise.all(keys
-        .filter(key => key !== CACHE_NAME)
+        // 'radio-cache-' は、ドメイン直下にあったころの古いキャッシュ
+        .filter(key => key !== CACHE_NAME && (key.startsWith(CACHE_PREFIX) || key.startsWith('radio-cache-')))
         .map(key => caches.delete(key))
       );
     }).then(() => {
@@ -154,9 +124,24 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+// ★開発用サーバー（Live Server等: localhost / 192.168.x など）ではキャッシュを一切使わず
+// 常にネットワークから取得する。SW_VERSIONが変わらないローカル確認で、古いキャッシュの
+// index.html/CSS/JSが表示され続ける事故を防ぐ（本番 ikumi-searchtheradio.com には影響しない）。
+// ※ポート8899は自動テスト用（本番と同じキャッシュ動作を検証するため除外）
+const IS_DEV_ORIGIN = /^(localhost|127\.0\.0\.1|\[::1\]|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+)$/.test(self.location.hostname)
+  && self.location.port !== '8899';
+
 // 3. ネットワークリクエストへの介入処理
 self.addEventListener('fetch', (event) => {
   const { request } = event;
+  if (IS_DEV_ORIGIN) return; // 開発時は素通し（ブラウザが直接ネットワークから取得）
+
+  // GET以外（POST等）はキャッシュ対象外なので介入しない
+  if (request.method !== 'GET') return;
+
+  // http(s)以外（chrome-extension: 等）も介入しない
+  if (!request.url.startsWith('http')) return;
+
   const url = new URL(request.url);
 
   // JSONデータファイルは「Network First」
@@ -165,21 +150,18 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // CSS, JS, manifestなどは「Stale-While-Revalidate」
-  const swrExtensions = ['.css', '.js', '.webmanifest'];
-  if (swrExtensions.some(ext => url.pathname.endsWith(ext))) {
-    event.respondWith(staleWhileRevalidateStrategy(request));
-    return;
-  }
-
-  // ページのナビゲーションリクエスト (HTML) は「Network First」
+  // ★アトミック配信: CSS/JS/manifest/フォント/画像は「キャッシュ優先・裏更新なし」。
+  // 以前のStale-While-Revalidateは、GitHub PagesがURLの?v=クエリを無視して常に
+  // 最新の中身を返すため、古いURLのキャッシュ項目を個別に新しい中身へ上書きしてしまい、
+  // HTML・CSS・JSの版がバラバラに混ざったキャッシュができる事故が起きていた
+  // （Chromeで「カラーが壊れて強制リロードでも直らない」原因）。
+  // このSWバージョンのキャッシュはインストール時に一括取得した組で固定し、
+  // 更新は「新SWのインストール→自動リロード」の一本に統一する。
   if (request.mode === 'navigate') {
-    event.respondWith(networkFirstStrategy(request));
+    event.respondWith(appShellStrategy(request));
     return;
   }
-  
-  // 上記以外のアセット（フォント、ローカル画像など）は Stale-While-Revalidate を使う
-  event.respondWith(staleWhileRevalidateStrategy(request));
+  event.respondWith(cacheFirstStrategy(request));
 });
 
 
@@ -187,24 +169,47 @@ self.addEventListener('fetch', (event) => {
 // ★★★ キャッシュ戦略の関数群 ★★★
 // ===================================================
 
-// Stale-While-Revalidate 戦略 (Cache First戦略は不要になったので削除してOKです)
-async function staleWhileRevalidateStrategy(request) {
+// キャッシュ優先戦略（静的アセット用）:
+// このSWバージョンのインストール時に一括取得したものだけを返す（裏での個別上書きはしない）。
+// キャッシュに無いもの（新サムネイル等）はネットワークから取得してキャッシュに追加する。
+async function cacheFirstStrategy(request) {
   const cache = await caches.open(CACHE_NAME);
   const cachedResponse = await cache.match(request);
-  
-  const fetchPromise = fetch(request).then(networkResponse => {
+  if (cachedResponse) return cachedResponse;
+  try {
+    const networkResponse = await fetch(request);
     if (networkResponse.ok) {
       cache.put(request, networkResponse.clone());
     }
     return networkResponse;
-  }).catch(err => {
-    // ネットワークエラーが発生した場合のフォールバック
-    console.warn(`[SW] Fetch failed for ${request.url}; relying on cache.`, err);
-  });
+  } catch (err) {
+    // respondWith に undefined を渡すと TypeError になるため必ず Response を返す
+    console.warn(`[SW] Fetch failed for ${request.url}`, err);
+    return new Response('', { status: 504, statusText: 'Gateway Timeout' });
+  }
+}
 
-  // キャッシュがあればそれを返し、裏でネットワークリクエストを実行
-  // キャッシュがなければネットワークリクエストの結果を待つ
-  return cachedResponse || fetchPromise;
+// アプリシェル戦略（ナビゲーション用）:
+// キャッシュ済みのトップページを即座に返して白画面をなくす。
+// ★変更: 以前あった「裏で最新版を取得してキャッシュ上書き」は廃止した。
+// HTMLだけが先に新しくなると、同キャッシュ内のCSS/JSと版がズレて配色崩れ等を起こすため。
+// 更新は「新SWのインストール（新キャッシュへ一括取得）→自動リロード」で行われる。
+async function appShellStrategy(request) {
+  const cache = await caches.open(CACHE_NAME);
+  // ?q=... などクエリ付きURLでも同じアプリシェル(トップページ)を返す
+  const cached = await cache.match('./') || await cache.match('index.html');
+  if (cached) return cached;
+
+  try {
+    const networkResponse = await fetch(request);
+    return networkResponse;
+  } catch (e) {
+    return new Response('オフラインのため読み込めませんでした。', {
+      status: 503,
+      statusText: 'Service Unavailable',
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
 }
 
 // Network First 戦略 (変更なし)
@@ -219,15 +224,26 @@ async function networkFirstStrategy(request) {
   } catch (error) {
     console.log('[SW] Network failed, falling back to cache for:', request.url);
     const cachedResponse = await caches.match(request);
-    // ページ自体(navigate)のリクエストが失敗した場合、トップページを返す
-    return cachedResponse || await caches.match('/');
+    // ページ自体(navigate)のリクエストが失敗した場合、トップページを返す。
+    // それも無い場合は undefined ではなく必ず有効な Response を返す（respondWithのTypeError防止）
+    return cachedResponse
+      || await caches.match('./')
+      || new Response('オフラインのため読み込めませんでした。', {
+           status: 503,
+           statusText: 'Service Unavailable',
+           headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+         });
   }
 }
 
 
-// SKIP_WAITINGメッセージを受け取った際の処理
+// ページからのメッセージ処理
 self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
+  if (!event.data) return;
+  if (event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
+  } else if (event.data.type === 'PRECACHE_THUMBS') {
+    // ページ描画が落ち着いた頃に呼ばれる、サムネイルの事前キャッシュ依頼
+    event.waitUntil(precacheMissingThumbnails());
   }
 });

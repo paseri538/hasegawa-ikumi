@@ -1,5 +1,15 @@
 let isInputFocused = false;
 
+// リロードのたびにブラウザがスクロール位置を復元し、動的ビューポート(iOSのアドレスバー等)や
+// 非同期描画とのズレで少しずつ下へずれていくのを防ぐ。常に先頭表示が正しいサイトなので
+// 復元は手動管理にし、初期化時と読み込み完了時に先頭へ戻す。
+if ('scrollRestoration' in history) {
+  try { history.scrollRestoration = 'manual'; } catch (e) {}
+}
+const resetScrollTop = () => { try { window.scrollTo(0, 0); } catch (e) {} };
+window.addEventListener('load', resetScrollTop);
+window.addEventListener('pageshow', resetScrollTop); // BFキャッシュ復帰時も先頭へ
+
 /**
  * ===================================================
  * ★★★ データと状態管理 ★★★
@@ -7,61 +17,216 @@ let isInputFocused = false;
  */
 let data = [];
 let CUSTOM_READINGS = {};
-let READING_TO_LABEL = {}; 
-let selectedCategories = []; 
-let selectedGuests = []; 
+let READING_TO_LABEL = {}; // 読み仮名から正規表記へのマップ
+// ★性能: 検索のたびに全キーへ normalize() をかけ直さないよう、読み仮名辞書の
+// 正規化済みインデックスを起動時に1回だけ構築してキャッシュする（低速端末対策）
+let READINGS_INDEX = [];
+let selectedCategories = [];
 let selectedCorners = [];
 let selectedYears = [];
-let selectedWorks = ""; 
-// ▼▼▼ 追加 ▼▼▼
-let selectedPerson = "";
-let PERSON_LIST = [];
-// ▲▲▲ 追加 ▲▲▲
+let selectedWorks = "";   // 出演作品名（プルダウン・単一選択）
+let selectedPerson = "";  // 人物名（プルダウン・単一選択）
+let PERSON_LIST = [];     // readings.json のキー＝人物名の一覧
 let currentPage = 1;
-const pageSize = 20;
+const pageSize = 50;
 let lastResults = [];
 let clearAutocompleteSuggestions = () => {};
+// 検索候補を、いまのデータで作り直す（データを読み直したとき。initializeAutocomplete() が中身を入れる）
+let rebuildAutocompleteEntries = () => {};
 let isSearchTriggered = false;
 let historyData = [];
-let photoMemoryData = {};
-let dokokaraData = {}; 
-let onshotData = [];  
+let photoMemoryData = {}; // フォトメモリー: { 回番号: { title, links: [{label, url}] } }
+let dokokaraData = {};    // あなたの長谷川育美はどこから？: { 回番号: { title } }
+let onshotData = [];      // スタジオオンショット: [{ date, label, url }]
+// 関連ワード（related.json）: { "語": ["関連する語", …] }。その語（読みでも）を打つと、関連する語も検索候補に出す。
+// 検索結果には混ぜない（候補に出すだけ。さーち・ざ・らじお！と同じ仕組み）
+let RELATED_WORDS = {};
+// ★コーナーの中身（回 → 文字）。そのコーナーで検索・絞り込みしたとき、カードのサブタイトルの行を
+//   この中身に差し替える。キーワード検索にも中身を入れる（さーち・ざ・らじお！の CORNER_TEXTS と同じ考え方）。
+//   中身のファイルは { "56": { "title": "…" } } の形（編集ツールの「コーナー」の欄で入力）
+const CORNER_TEXTS = [
+  { corner: 'フォトメモリー', get: () => photoMemoryData },              // 写真の話題
+  { corner: 'あなたの長谷川育美はどこから？', get: () => dokokaraData }   // 作品名
+];
+const cornerTextOf = (c, ep) => {
+  const box = c.get() || {};
+  const v = box[ep];
+  const text = v && typeof v === 'object' ? v.title : v;
+  return typeof text === 'string' && text.trim() ? decodeEntities(text) : '';
+};
+// コーナーの中身から、検索候補に出す言葉を取り出す（「…」『…』の中身。括弧が無ければ , 、 で区切る）
+//   例: "『くノ一ツバキの胸の内』など" → ["くノ一ツバキの胸の内"]
+function cornerTextItems(text) {
+  const s = String(text || '');
+  const quoted = [...s.matchAll(/[「『]([^」』]+)[」』]/g)].map(m => m[1].trim()).filter(Boolean);
+  return quoted.length ? quoted : s.split(/[,、，]/).map(t => t.trim()).filter(Boolean);
+}
 
-const FAV_KEY = 'str_favs_v1';
-let favorites = loadFavs();
+/* ===================================================
+ * タイムスタンプ機能（お気に入りの後継）
+ * localStorage に { エピソードURL: [{ t: 秒数, label: 文字列 }, ...] } を保存。
+ * タイムスタンプが1件以上ある回を「お気に入り」として扱う。
+ * ※このサイトはYouTubeではなくAuDee配信のため、動画IDではなく
+ *   エピソードページのURLそのものを各回のIDとして使う（旧お気に入りと同じキー）。
+ * =================================================== */
+const TS_KEY = 'str_timestamps_v1';
+const FAV_KEY = 'str_favs_v1'; // 旧お気に入りキー（初回移行にのみ使用）
+// ブラウザに「このサイトのデータを自動削除しないで」と申告する（対応環境のみ・失敗しても無害）。
+// 容量逼迫時の自動退避（eviction）からlocalStorageのタイムスタンプを守る。
+// SafariのITP（7日間未訪問での削除）まで防げる保証はないため、あくまで補助的な保険。
+if (navigator.storage?.persist) {
+  navigator.storage.persist().catch(() => {});
+}
+let timestamps = loadTimestamps();
 let showFavoritesOnly = false;
 let isRestoringURL = false;
+
+// パーソナリティ本人（全回出演）。本人名・愛称で検索された時は全エピソードを表示する
+const PERSONALITY = "長谷川育美";
 
 /**
  * ===================================================
  * ★★★ ユーティリティ関数 ★★★
  * ===================================================
  */
-const normalize = (s) => (s || '').normalize('NFKC').replace(/[ァ-ン]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0x60)).toLowerCase().replace(/\s+/g, '');
+// 「～」と「〜」は同じ文字として扱う（NFKC で ～ は ~ になるので、両方を 〜 にそろえる）
+const normalize = (s) => (s || '').normalize('NFKC').replace(/[~〜]/g, '〜').replace(/[ァ-ン]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0x60)).toLowerCase().replace(/\s+/g, '');
+// 「#43」「#43 ぼっち」「第43回」「第43回 ぼっち」のような回番号指定クエリを解析する（全角も可）。
+// ep: 回番号 / rest: 番号の後ろのキーワード（カードの時刻リンク解決に使う）
+const parseEpisodeQuery = (s) => {
+  const m = (s || '').normalize('NFKC').trim().match(/^(?:#\s*(\d+)|第\s*(\d+)\s*回)(?:\s+(.+))?$/);
+  return m ? { ep: parseInt(m[1] || m[2], 10), rest: (m[3] || '').trim() } : null;
+};
+// 全エピソード表示ワード（正規化形）: 長谷川育美さんは全回出演のため、
+// 本人名・愛称で検索された時は絞り込まずに全エピソードを表示する。
+// 中身は readings/keywords 読込後に本人名＋登録済みの愛称から作る（loadExternalData）
+let ALL_EPISODES_TERMS = new Set([normalize(PERSONALITY)]);
 const stripTimeSuffix = (s) => (s || '').replace(/[＠@]\s*\d{1,2}:\d{2}(?::\d{2})?\s*$/, '');
-const getVideoId = (link) => link; 
-const getHashNumber = (title) => title.match(/#(\d+)/)?.[0] || title;
-
-// 数字なら数値、それ以外の文字列（お手元、緊急、動画など）はすべて -1 (表示対象) とする
+// 各回のID（お気に入り・タイムスタンプの保存キー）。AuDeeのエピソードURLをそのまま使う
+const getEpisodeId = (link) => link || null;
+// 数字の回は数値、それ以外（お手元1 など番号を持たない回）は -1（表示対象）、空は -2（非表示）
 const getEpisodeNumber = (episode) => {
-  if (!episode) return -2; // 空の場合は非表示
+  if (!episode) return -2;
   return /^\d+$/.test(episode) ? parseInt(episode, 10) : -1;
 };
+// 「第89回「激重感情ヘアです」」→ { num: "第89回", rest: "「激重感情ヘアです」" }
+const splitEpisodeTitle = (title) => {
+  const m = (title || '').match(/^((?:第\d+回|#\S+))\s*(.*)$/);
+  return m ? { num: m[1], rest: m[2] } : { num: '', rest: title || '' };
+};
+const asArray = (v) => Array.isArray(v) ? v.filter(Boolean) : (v ? [v] : []);
+// メン限動画（「育美のお手元」など /video/ の回）かどうか
+const MEMBER_VIDEO_CORNER = "育美のお手元";
+const isMemberVideoEpisode = (ep) => /\/video\//.test(ep.link || '') || /^お手元/.test(String(ep.episode || ''));
 
-const getThumbnailUrl = (link) => "";
+// localStorageのデータは手動編集や拡張機能・過去バージョンの不具合で壊れている可能性が
+// あるため、読み込み時に形を検証して正常なエントリだけを残す。
+// （不正な1件のせいで一覧描画や検索がクラッシュするのを防ぐ）
+function sanitizeTimestamps(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [id, arr] of Object.entries(raw)) {
+    if (!Array.isArray(arr)) continue;
+    const clean = arr
+      .filter(e => e && typeof e === 'object')
+      .map(e => ({
+        t: (typeof e.t === 'number' && isFinite(e.t) && e.t >= 0) ? Math.floor(e.t) : null,
+        label: typeof e.label === 'string' ? e.label.slice(0, 500) : ''
+      }))
+      .filter(e => e.t != null || e.label);
+    if (clean.length) out[id] = clean;
+  }
+  return out;
+}
 
-function loadFavs() {
-  try { return new Set(JSON.parse(localStorage.getItem(FAV_KEY) || '[]')); } catch { return new Set(); }
+function loadTimestamps() {
+  try {
+    const stored = localStorage.getItem(TS_KEY);
+    if (stored) return sanitizeTimestamps(JSON.parse(stored));
+    // 初回のみ: 旧お気に入りを「0:00 お気に入り」として引き継ぐ
+    const oldFavs = JSON.parse(localStorage.getItem(FAV_KEY) || '[]');
+    const migrated = {};
+    if (Array.isArray(oldFavs)) {
+      oldFavs.filter(id => typeof id === 'string').forEach(id => { migrated[id] = [{ t: 0, label: 'お気に入り' }]; });
+    }
+    if (Object.keys(migrated).length) localStorage.setItem(TS_KEY, JSON.stringify(migrated));
+    return migrated;
+  } catch { return {}; }
 }
-function saveFavs() {
-  try { localStorage.setItem(FAV_KEY, JSON.stringify([...favorites])); } catch (e) { console.error("Failed to save favorites:", e); }
+function saveTimestamps() {
+  try { localStorage.setItem(TS_KEY, JSON.stringify(timestamps)); } catch (e) { console.error("Failed to save timestamps:", e); }
 }
-function isFavorite(id) { return id ? favorites.has(id) : false; }
-function toggleFavorite(id) {
+function getTimestamps(id) { return (id && timestamps[id]) ? timestamps[id] : []; }
+function isFavorite(id) { return getTimestamps(id).length > 0; }
+// 時間指定なし（t: null）のメモは末尾に並べる
+function compareTs(a, b) {
+  if (a.t == null && b.t == null) return 0;
+  if (a.t == null) return 1;
+  if (b.t == null) return -1;
+  return a.t - b.t;
+}
+// 全件を置き換え（登録・編集の保存用）。保存は1回だけ行う。
+function setTimestampsAll(id, entries) {
   if (!id) return;
-  favorites.has(id) ? favorites.delete(id) : favorites.add(id);
-  saveFavs();
+  if (entries.length === 0) { delete timestamps[id]; }
+  else { timestamps[id] = entries.slice().sort(compareTs); }
+  saveTimestamps();
 }
+// "1:28:30" / "57:50" のような時間表記 → 秒数（不明なら null）
+function durationToSec(str) {
+  const m = (str || '').trim().match(/^(?:(\d{1,2}):)?(\d{1,3}):(\d{2})$/);
+  if (!m) return null;
+  return (m[1] ? parseInt(m[1], 10) * 3600 : 0) + parseInt(m[2], 10) * 60 + parseInt(m[3], 10);
+}
+// 全エピソードのタイムスタンプ（＝お気に入り）を一括削除する
+function clearAllTimestamps() {
+  for (const key of Object.keys(timestamps)) delete timestamps[key];
+  saveTimestamps();
+}
+
+function removeTimestamp(id, index) {
+  if (!timestamps[id]) return;
+  timestamps[id].splice(index, 1);
+  if (timestamps[id].length === 0) delete timestamps[id];
+  saveTimestamps();
+}
+// 秒数 → "3:00" / "1:03:00" 表記
+function formatTs(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
+// "3:00 好きなシーン" → { t: 180, label: "好きなシーン" } | null
+function parseTsInput(raw) {
+  const text = (raw || '').trim().replace(/[：]/g, ':').replace(/[　]/g, ' ');
+  const m = text.match(/^(?:(\d{1,2}):)?(\d{1,3}):(\d{1,2})(?:\s+(.*))?$/s);
+  if (!m) return null;
+  const h = m[1] ? parseInt(m[1], 10) : 0;
+  const mm = parseInt(m[2], 10), ss = parseInt(m[3], 10);
+  if (ss > 59 || (m[1] && mm > 59)) return null;
+  const t = h * 3600 + mm * 60 + ss;
+  const label = (m[4] || '').trim();
+  return { t, label };
+}
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// JSONデータ内に「&amp;」などHTML表記で書かれた文字を元の文字に戻す（表示時の二重エスケープ防止）。
+// textarea に入れて読み出すだけなのでスクリプトは実行されない
+// 英数字部分だけImpactフォントの<span>で包んだ安全なHTMLを作る。
+// 先にエスケープしてから置換すると「&amp;」の amp まで包んで文字化けするため、
+// 分割 → 各部分をエスケープ の順で組み立てる
+const impactifyHtml = (text, re = /([#A-Za-z0-9:.]+)/) =>
+  String(text == null ? '' : text).split(re)
+    .map((part, i) => i % 2 ? `<span class="impact-number">${escapeHtml(part)}</span>` : escapeHtml(part))
+    .join('');
+const decodeEntities = (() => {
+  let ta = null;
+  return (s) => {
+    const str = String(s == null ? '' : s);
+    if (!str.includes('&')) return str;
+    ta = ta || document.createElement('textarea');
+    ta.innerHTML = str;
+    return ta.value;
+  };
+})();
 
 function debounce(fn, ms = 40) {
   let timerId;
@@ -77,7 +242,7 @@ function debounce(fn, ms = 40) {
 
 /**
  * ===================================================
- * ★★★ 検索アルゴリズム ★★★
+ * ★★★ 検索エンジン級アルゴリズム (God Tier) ★★★
  * ===================================================
  */
 
@@ -101,14 +266,14 @@ function baseCharNormalize(str) {
   return str.normalize('NFD').replace(/[\u3099\u309A]/g, '').normalize('NFC');
 }
 
-// 3. ローマ字変換
+// 3. 高機能ローマ字変換
 function kanaToRomaji(str) {
   const map = {
     'あ':'a','い':'i','う':'u','え':'e','お':'o',
     'か':'ka','き':'ki','く':'ku','け':'ke','こ':'ko',
     'さ':'sa','し':'shi','す':'su','せ':'se','そ':'so',
-    'た':'ta','ち':'chi','つ':'tsu','て':'te','te':'te','と':'to',
-    'な':'na','ni':'ni','ぬ':'nu','ね':'ne','の':'no',
+    'た':'ta','ち':'chi','つ':'tsu','て':'te','と':'to',
+    'な':'na','に':'ni','ぬ':'nu','ね':'ne','の':'no',
     'は':'ha','ひ':'hi','ふ':'fu','へ':'he','ほ':'ho',
     'ま':'ma','み':'mi','む':'mu','め':'me','も':'mo',
     'や':'ya','ゆ':'yu','よ':'yo',
@@ -129,7 +294,7 @@ function kanaToRomaji(str) {
     'ぎゃ':'gya','ぎゅ':'gyu','ぎょ':'gyo',
     'じゃ':'ja','じゅ':'ju','じょ':'jo',
     'びゃ':'bya','びゅ':'byu','びょ':'byo',
-    'ぴゃ':'pya','ぴゅ':'pyo',
+    'ぴゃ':'pya','ぴゅ':'pyu','ぴょ':'pyo',
     'si':'shi', 'ti':'chi', 'tu':'tsu', 'hu':'fu', 'zi':'ji',
     'xtsu': 'tu'
   };
@@ -159,15 +324,22 @@ function kanaToRomaji(str) {
   return res.replace(/si/g, 'shi').replace(/tu/g, 'tsu').replace(/zi/g, 'ji').replace(/hu/g, 'fu');
 }
 
-// 4. Jaro-Winkler
+// 4. Jaro-Winkler距離
+// ★性能: 一致フラグ配列を呼び出しごとに生成せず使い回す（結果は完全に同一）
+let _jwM1 = new Uint8Array(0);
+let _jwM2 = new Uint8Array(0);
 function jaroWinkler(s1, s2) {
   let m = 0;
   if (s1.length === 0 || s2.length === 0) return 0;
   if (s1 === s2) return 1;
 
   const matchWindow = Math.floor(Math.max(s1.length, s2.length) / 2) - 1;
-  const s1Matches = new Array(s1.length).fill(false);
-  const s2Matches = new Array(s2.length).fill(false);
+  if (_jwM1.length < s1.length) _jwM1 = new Uint8Array(s1.length);
+  if (_jwM2.length < s2.length) _jwM2 = new Uint8Array(s2.length);
+  _jwM1.fill(0, 0, s1.length);
+  _jwM2.fill(0, 0, s2.length);
+  const s1Matches = _jwM1;
+  const s2Matches = _jwM2;
 
   for (let i = 0; i < s1.length; i++) {
     const start = Math.max(0, i - matchWindow);
@@ -175,8 +347,8 @@ function jaroWinkler(s1, s2) {
     for (let j = start; j < end; j++) {
       if (s2Matches[j]) continue;
       if (s1[i] !== s2[j]) continue;
-      s1Matches[i] = true;
-      s2Matches[j] = true;
+      s1Matches[i] = 1;
+      s2Matches[j] = 1;
       m++;
       break;
     }
@@ -203,46 +375,50 @@ function jaroWinkler(s1, s2) {
   return jaro + l * 0.1 * (1 - jaro);
 }
 
-// 5. Damerau-Levenshtein
+// 5. Damerau-Levenshtein距離
+// ★性能: 旧実装は呼び出しごとに2次元配列＋文字位置マップを生成しており、
+// 「もしかして」計算（1検索で全コーパス語×最大2回呼ばれる）のGC負荷が
+// 低速端末で支配的だった。使い回しのフラットInt32Arrayに変更。
+// 漸化式・返り値は旧実装と完全に同一。
+let _dlBuf = new Int32Array(0);
+const _dlSd = new Map();
 function damerauLevenshtein(source, target) {
   if (!source) return target ? target.length : 0;
   if (!target) return source.length;
-  const sourceLength = source.length;
-  const targetLength = target.length;
-  const score = Array(sourceLength + 2).fill(0).map(() => Array(targetLength + 2).fill(0));
-  const INF = sourceLength + targetLength;
-  score[0][0] = INF;
-  for (let i = 0; i <= sourceLength; i++) { score[i + 1][1] = i; score[i + 1][0] = INF; }
-  for (let j = 0; j <= targetLength; j++) { score[1][j + 1] = j; score[0][j + 1] = INF; }
-  const sd = {};
-  const combinedStr = source + target;
-  for (let i = 0; i < combinedStr.length; i++) sd[combinedStr[i]] = 0;
-  for (let i = 1; i <= sourceLength; i++) {
+  const n = source.length;
+  const m = target.length;
+  const C = m + 2; // 列数（フラット配列の行ストライド）
+  if (_dlBuf.length < (n + 2) * C) _dlBuf = new Int32Array((n + 2) * C);
+  const score = _dlBuf;
+  const INF = n + m;
+  score[0] = INF;
+  for (let i = 0; i <= n; i++) { score[(i + 1) * C + 1] = i; score[(i + 1) * C] = INF; }
+  for (let j = 0; j <= m; j++) { score[C + j + 1] = j; score[j + 1] = INF; }
+  _dlSd.clear();
+  for (let i = 0; i < n; i++) _dlSd.set(source[i], 0);
+  for (let j = 0; j < m; j++) if (!_dlSd.has(target[j])) _dlSd.set(target[j], 0);
+  for (let i = 1; i <= n; i++) {
     let DB = 0;
-    for (let j = 1; j <= targetLength; j++) {
-      const i1 = sd[target[j - 1]];
+    for (let j = 1; j <= m; j++) {
+      const i1 = _dlSd.get(target[j - 1]);
       const j1 = DB;
+      let v;
       if (source[i - 1] === target[j - 1]) {
-        score[i + 1][j + 1] = score[i][j];
+        v = score[i * C + j];
         DB = j;
       } else {
-        score[i + 1][j + 1] = Math.min(score[i][j], Math.min(score[i + 1][j], score[i][j + 1])) + 1;
+        const a = score[i * C + j], b = score[(i + 1) * C + j], c = score[i * C + j + 1];
+        v = (a < b ? (a < c ? a : c) : (b < c ? b : c)) + 1;
       }
-      score[i + 1][j + 1] = Math.min(score[i + 1][j + 1], score[i1][j1] + (i - i1 - 1) + 1 + (j - j1 - 1));
+      const trans = score[i1 * C + j1] + (i - i1 - 1) + 1 + (j - j1 - 1);
+      score[(i + 1) * C + (j + 1)] = v < trans ? v : trans;
     }
-    sd[source[i - 1]] = i;
+    _dlSd.set(source[i - 1], i);
   }
-  return score[sourceLength + 1][targetLength + 1];
+  return score[(n + 1) * C + (m + 1)];
 }
 
 // 6. ダイス係数 & ユニグラム
-function getBigrams(str) {
-  const bigrams = new Set();
-  for (let i = 0; i < str.length - 1; i++) {
-    bigrams.add(str.slice(i, i + 2));
-  }
-  return bigrams;
-}
 function unigramSimilarity(s1, s2) {
   const set1 = new Set(s1.split(''));
   const set2 = new Set(s2.split(''));
@@ -251,7 +427,7 @@ function unigramSimilarity(s1, s2) {
   return (2 * intersection) / (set1.size + set2.size);
 }
 
-// 7. サブシーケンス
+// 7. サブシーケンス判定
 function getSubsequenceScore(query, target) {
   if (!query || !target) return 0;
   if (query[0] !== target[0]) return 0; 
@@ -276,11 +452,12 @@ function getSubsequenceScore(query, target) {
   return 0;
 }
 
-// DidYouMean Logic
+// ★修正: findDidYouMean (複数候補、部分一致、エイリアス解決対応、完全一致除外版)
 function findDidYouMean(query) {
   if (!query || query.length < 2) return [];
   
   const normQuery = superNormalize(query);
+  
   if (window.exactKeyNorms && window.exactKeyNorms.has(normQuery)) {
       return [];
   }
@@ -289,38 +466,66 @@ function findDidYouMean(query) {
   const isRomajiInput = (romanQuery.length === normalize(query).length) && (romanQuery.length > 2);
   const baseQuery = baseCharNormalize(normQuery);
 
-  if (!window.searchCorpus) return [];
+  if (!window.corpusIndex) return [];
+
   const candidatesMap = new Map();
 
-  for (const word of window.searchCorpus) {
-    const normTarget = superNormalize(word);
-    const baseTarget = baseCharNormalize(normTarget);
+  // クエリ側の文字集合は1回だけ作る（unigramSimilarityと同一の計算に使用）
+  const qUniSet = new Set(normQuery.split(''));
+
+  // ★性能: 単語ごとの superNormalize / baseCharNormalize は起動時に計算済みの
+  // corpusIndex を参照する（毎回の検索で数千回の正規化処理が消える。結果は同一）
+  for (const entry of window.corpusIndex) {
+    const word = entry.w;
+    const normTarget = entry.norm;
+    const baseTarget = entry.base;
+
     let finalScore = 0;
 
     const jwScore = jaroWinkler(normQuery, normTarget) * 100;
-    const dist = damerauLevenshtein(normQuery, normTarget);
     const len = Math.max(normQuery.length, normTarget.length);
-    const dlScore = Math.max(0, (1 - dist / len) * 100);
     const subScore = getSubsequenceScore(normQuery, normTarget);
-    const uniScore = unigramSimilarity(normQuery, normTarget) * 100;
+    // unigramSimilarity と同一の計算（(2×共通文字数)/(集合サイズ和)）を、
+    // 事前計算済みの文字集合で行う（毎回2つのSetを生成しない）
+    let uniInter = 0;
+    qUniSet.forEach(ch => { if (entry.uniSet.has(ch)) uniInter++; });
+    const uniScore = ((2 * uniInter) / (qUniSet.size + entry.uniSet.size)) * 100;
+    let best = Math.max(jwScore, subScore, uniScore);
+
+    // ★性能: 編集距離は「長さの差」以上になることが保証されるため、
+    // その上限スコア (1-|Δ長|/len)*100 が既に他のスコア以下なら計算しても
+    // 最終スコア(max)は変わらない → 計算自体を省略できる（結果は完全に同一）
+    let dlScore = 0;
+    const dlUb = (1 - Math.abs(normQuery.length - normTarget.length) / len) * 100;
+    if (dlUb > best) {
+      const dist = damerauLevenshtein(normQuery, normTarget);
+      dlScore = Math.max(0, (1 - dist / len) * 100);
+      if (dlScore > best) best = dlScore;
+    }
 
     let baseScore = 0;
     if (baseQuery === baseTarget && baseQuery.length > 1) {
         baseScore = 95;
     } else {
-        const baseDist = damerauLevenshtein(baseQuery, baseTarget);
-        baseScore = Math.max(0, (1 - baseDist / len) * 100);
+        // 上と同じ理屈で、上限が既存スコア以下なら省略（maxの結果は不変）
+        const baseUb = (1 - Math.abs(baseQuery.length - baseTarget.length) / len) * 100;
+        if (baseUb > best) {
+          const baseDist = damerauLevenshtein(baseQuery, baseTarget);
+          baseScore = Math.max(0, (1 - baseDist / len) * 100);
+        }
     }
 
-    finalScore = Math.max(jwScore, dlScore, subScore, uniScore, baseScore);
+    finalScore = Math.max(best, baseScore);
 
     if (isRomajiInput) {
-       const romanTarget = kanaToRomaji(normTarget);
-       const romanJw = jaroWinkler(romanQuery, romanTarget) * 100;
-       if (romanJw > 85) finalScore = Math.max(finalScore, romanJw); 
+       // ローマ字変換は必要になった時だけ行い、エントリにキャッシュする
+       if (entry.roman == null) entry.roman = kanaToRomaji(normTarget);
+       const romanJw = jaroWinkler(romanQuery, entry.roman) * 100;
+       if (romanJw > 85) finalScore = Math.max(finalScore, romanJw);
     }
 
     const isSubstring = (normQuery.length >= 2 && normTarget.includes(normQuery)) || (normTarget.length >= 2 && normQuery.includes(normTarget));
+
     if (isSubstring) {
       finalScore = Math.max(finalScore, 98);
     } else {
@@ -362,70 +567,79 @@ function findDidYouMean(query) {
  */
 async function loadExternalData() {
   try {
-    const [episodesRes, readingsRes, keywordsRes, historyRes, pmRes, dkRes, osRes] = await Promise.all([
+    // 補助データ（読み仮名・キーワード・履歴など）は1つ欠けてもサイト全体を壊さず、
+    // フォールバック値で続行する。episodes.json だけは必須なので失敗したらエラー表示。
+    const safeFetchJson = (url, fallback) =>
+      fetch(url).then(res => res.ok ? res.json() : fallback).catch(() => fallback);
+
+    const [episodesRes, readingsData, keywordsData, relatedData, histData, pmData, dkData, osData] = await Promise.all([
       fetch('episodes.json'),
-      fetch('readings.json'),
-      fetch('keywords.json'),
-      fetch('history.json'),
-      fetch('photomemory.json'),
-      fetch('dokokara.json'),
-      fetch('onshot.json').catch(() => null)
+      safeFetchJson('readings.json', {}),
+      safeFetchJson('keywords.json', {}),
+      safeFetchJson('related.json', {}),
+      safeFetchJson('history.json', []),
+      safeFetchJson('photomemory.json', {}),
+      safeFetchJson('dokokara.json', {}),
+      safeFetchJson('onshot.json', [])
     ]);
+    if (!episodesRes.ok) throw new Error(`episodes.json: HTTP ${episodesRes.status}`);
     const episodesData = await episodesRes.json();
-    const readingsData = await readingsRes.json();
-    const keywordsData = await keywordsRes.json();
-    historyData = await historyRes.json();
-    
-    // ▼▼▼ 追加：readings.jsonから人物名のリストを取得 ▼▼▼
-    PERSON_LIST = Object.keys(readingsData);
-    // ▲▲▲ 追加 ▲▲▲
-
-    try {
-        photoMemoryData = await pmRes.json();
-    } catch (e) {
-        console.warn("photomemory.json loading failed", e);
-        photoMemoryData = {};       
-    }
-
-    try {
-      dokokaraData = await dkRes.json();
-    } catch (e) {
-      console.warn("dokokara.json loading failed", e);
-      dokokaraData = {};
-    }
-
-    try {
-      if (osRes) onshotData = await osRes.json();
-    } catch (e) {
-      console.warn("onshot.json loading failed", e);
-      onshotData = [];
-    }
+    if (!Array.isArray(episodesData)) throw new Error('episodes.json: 配列ではありません');
+    const isDict = (d) => !!d && typeof d === 'object' && !Array.isArray(d);
+    historyData = Array.isArray(histData) ? histData : [];
+    photoMemoryData = isDict(pmData) ? pmData : {};
+    dokokaraData = isDict(dkData) ? dkData : {};
+    onshotData = Array.isArray(osData) ? osData : [];
+    RELATED_WORDS = isDict(relatedData) ? relatedData : {};
+    // 人物名プルダウンの選択肢は readings.json に登録された人物
+    PERSON_LIST = isDict(readingsData) ? Object.keys(readingsData) : [];
 
     data = episodesData.map(ep => {
+      ep.title = ep.title || String(ep.episode || '');
+      // category / works は文字列でも配列でも書けるので、内部では配列にそろえる
+      ep.categories = asArray(ep.category);
+      ep.worksList = asArray(ep.works).map(stripTimeSuffix).filter(Boolean);
       const keywordsWithoutTimestamp = (ep.keywords || []).map(stripTimeSuffix);
-      const guestText = Array.isArray(ep.guest) ? ep.guest.join(" ") : (ep.guest || "");
-      
-      const categoryText = Array.isArray(ep.category) ? ep.category.join(" ") : (ep.category || "");
-
-      
-      // 作品名からも時間を除外してテキスト化
-      const worksRaw = Array.isArray(ep.works) ? ep.works : [ep.works || ""];
-      const worksText = worksRaw.map(stripTimeSuffix).join(" ");
-
-      // combined に worksText を追加
-      const combined = [ep.title, guestText, categoryText, worksText, keywordsWithoutTimestamp.join(" ")].join(" ");
-      
-
-      ep.searchText = normalize(combined);
+      // タイトル・カテゴリ・出演作品・キーワードを1つずつ区切って持つ
+      // （別々のキーワードがつながって当たらないように。さーち・ざ・らじお！と同じ）
+      ep.searchText = [ep.title, ...ep.categories, ...ep.worksList, ...keywordsWithoutTimestamp].map(normalize).join('\u0001');
+      // ★コーナーの中身（フォトメモリーの話題・どこから？の作品名）もキーワード検索に引っかかるようにする。
+      //   カテゴリ・コーナー等の絞り込みには使わないよう、searchText とは別に持つ
+      ep.cornerTexts = [];
+      CORNER_TEXTS.forEach(c => {
+        const text = cornerTextOf(c, ep.episode);
+        if (text) ep.cornerTexts.push({ corner: c.corner, cornerN: normalize(c.corner), text, norm: normalize(text) });
+      });
+      // お気に入り・タイムスタンプの保存キー（エピソードURL）
+      ep.favId = getEpisodeId(ep.link);
+      ep.isMemberVideo = isMemberVideoEpisode(ep);
+      // ★性能: 「キーワード@時刻」の解析と正規化も起動時に済ませる（findHitTime用）。
+      // 出演作品(works)にも「作品名@時刻」が書けるので一緒に解析する
+      ep.kwTimes = [...(ep.keywords || []), ...asArray(ep.works)].map(parseKeywordTime).filter(Boolean)
+        .map(p => ({ base: p.base, label: p.label, seconds: p.seconds, baseN: normalize(p.base) }));
       return ep;
     });
 
-    CUSTOM_READINGS = { ...readingsData, ...keywordsData };
+    CUSTOM_READINGS = {
+      ...((readingsData && typeof readingsData === 'object') ? readingsData : {}),
+      ...((keywordsData && typeof keywordsData === 'object') ? keywordsData : {})
+    };
+    READING_TO_LABEL = {};
     for (const kanji in CUSTOM_READINGS) {
       (CUSTOM_READINGS[kanji] || []).forEach(r => {
         READING_TO_LABEL[normalize(r)] = kanji;
       });
     }
+    // 本人名＋登録済みの愛称（2文字以下の短い読みは他の語と紛れるので除く）
+    ALL_EPISODES_TERMS = new Set([PERSONALITY, ...(CUSTOM_READINGS[PERSONALITY] || [])]
+      .map(normalize).filter(n => n.length >= 3));
+
+    // ★性能: getFilteredData が検索のたびに全キー・全読みへ normalize() をかけていたのを、
+    // ここで1回だけ正規化してインデックス化する（結果は完全に同一）
+    READINGS_INDEX = Object.entries(CUSTOM_READINGS).map(([key, readings]) => ({
+      normKey: normalize(key),
+      normReadings: (readings || []).map(r => normalize(r))
+    }));
 
     window.searchCorpus = new Set();
     window.canonicalMap = {}; 
@@ -460,30 +674,30 @@ async function loadExternalData() {
     }
     
     data.forEach(ep => {
-      if (Array.isArray(ep.guest)) {
-        ep.guest.forEach(g => addToCorpus(g, g));
-      } else if (ep.guest && ep.guest !== "その他") {
-        addToCorpus(ep.guest, ep.guest);
-      }
+      ep.worksList.forEach(w => addToCorpus(w, w));
       if (Array.isArray(ep.keywords)) {
         ep.keywords.forEach(k => {
           const cleanK = stripTimeSuffix(k);
           addToCorpus(cleanK, cleanK);
         });
       }
+      (ep.cornerTexts || []).forEach(c => cornerTextItems(c.text).forEach(w => addToCorpus(w, w)));
     });
 
-    // ====================================================================
-    // ★追加: Webフォント(Adobe Fonts)の動的サブセッティング対策
-    // 検索候補などで後から生成される文字にフォントが適用されない現象を防ぐため、
-    // 全データに含まれる文字を抽出し、透明な要素としてDOMに配置して事前ロードさせます。
-    // ====================================================================
+    // ★性能: findDidYouMean（もしかして候補）が検索のたびに全コーパス語へ
+    // superNormalize / baseCharNormalize をかけ直していたのを、ここで1回だけ
+    // 計算してキャッシュする。ローマ字形は初回必要時に遅延計算（roman: null）。
+    window.corpusIndex = Array.from(window.searchCorpus, w => {
+      const norm = superNormalize(w);
+      // uniSet: ユニグラム類似度用の文字集合（毎検索でSetを作り直さないための事前計算）
+      return { w, norm, base: baseCharNormalize(norm), roman: null, uniSet: new Set(norm.split('')) };
+    });
+
     const allChars = new Set();
     
     // エピソードデータから文字を抽出
     data.forEach(ep => {
-      const text = (ep.title || '') + 
-                   (Array.isArray(ep.guest) ? ep.guest.join('') : (ep.guest || '')) + 
+      const text = (ep.title || '') + ep.worksList.join('') +
                    (Array.isArray(ep.keywords) ? ep.keywords.join('') : '');
       for (const char of text) allChars.add(char);
     });
@@ -496,219 +710,218 @@ async function loadExternalData() {
       });
     }
 
-    // 抽出した全文字を結合
-    const charStr = Array.from(allChars).join('');
-    
-    // 画面外に透明な要素として配置
-    const hiddenFontDiv = document.createElement('div');
-    hiddenFontDiv.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;z-index:-1;';
-    
-    // ★修正：70-pro（標準）と 80-pro（太字）の両方のファミリーを個別に明示して強制ロードさせる
-    hiddenFontDiv.innerHTML = `
-      <span style="font-family: fot-udkakugoc70-pro, sans-serif;">${charStr}</span>
-      <span style="font-family: fot-udkakugoc80-pro, sans-serif;">${charStr}</span>
-    `;
-    document.body.appendChild(hiddenFontDiv);
-    // ====================================================================
+    // ---- フォントの明示プリロード（FOUT＝一瞬フォールバック表示 の防止） ----
+    // データだけでなく、履歴・関連リンク・画面内の静的テキストまで全ての文字を集め、
+    // document.fonts.load() で必要なサブセットを先に読み込む。読み込み完了までは
+    // ローディング画面で隠すため（下記 __fontsReady を待つ）、どの文字も
+    // 最初からAdobeフォントで表示され、一瞬だけ別フォントになる現象が起きない。
+    let corpus = Array.from(allChars).join('');
+    try {
+      corpus += JSON.stringify(data) + JSON.stringify(historyData || '') + JSON.stringify(photoMemoryData || '')
+        + JSON.stringify(dokokaraData || '') + JSON.stringify(onshotData || '');
+      if (document.body) corpus += (document.body.textContent || '');
+      // ユーザーが登録したタイムスタンプのメモの文字も先読みする。
+      // ここに含めないと、メモに使われた文字（☆や①など、かな漢字と別の
+      // unicode-rangeセグメントに入る記号類）がモーダル初回表示時に
+      // 一瞬だけ別フォントで描画されてしまう
+      corpus += JSON.stringify(timestamps || {});
+      // JSで後から生成される定型文字と、メモでよく使われる記号も常に先読みしておく
+      corpus += '★☆①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳●○◎△▲▽▼□■◇◆♪♡♥※→←↑↓！？';
+    } catch (e) {}
+    const uniqueChars = Array.from(new Set(corpus)).join('');
 
+    // 全文字ぶんのフォントを読み込む Promise。ローディング画面はこれ（＋上限時間）を待つ。
+    // Adobe本文フォント(400/700)に加え、番号・日時に使う Impact Numbers も先読みする。
+    const impactChars = '0123456789#:.／/・-〜~ ' + uniqueChars;
+    window.__fontsReady = (async () => {
+      try {
+        if (document.fonts && document.fonts.load) {
+          // まずサイト内で実際に使う文字ぶんの読み込みを開始する
+          // （キットCSS登録前でも効き、初回表示に必要な最小セットを最速で確保）
+          const kick = Promise.all([
+            document.fonts.load('400 1em fot-udkakugoc70-pro', uniqueChars),
+            document.fonts.load('700 1em fot-udkakugoc80-pro', uniqueChars),
+            document.fonts.load('1em "Impact Numbers"', impactChars),
+          ]);
+
+          // ★フォントが持つ全文字を先読みする:
+          // Adobe Fontsはフォントをunicode-rangeで複数ファイルに分割して配信するため、
+          // 文字列指定の load() では該当文字のセグメントしか読み込まれず、
+          // 想定外の文字（新しいメモの記号等）が後から一瞬別フォントで出る余地が残る。
+          // FontFace オブジェクトを直接 load() すると分割ファイルそのものを取得できるので、
+          // 対象ファミリーの全セグメントを一括で読み込む（2回目以降はキャッシュから即時）。
+          const FAMILIES = ['fot-udkakugoc70-pro', 'fot-udkakugoc80-pro', 'Impact Numbers'];
+          const collectFaces = () => {
+            const faces = [];
+            document.fonts.forEach(f => {
+              const fam = (f.family || '').replace(/^["']|["']$/g, '');
+              if (FAMILIES.includes(fam)) faces.push(f);
+            });
+            return faces;
+          };
+          // Adobeのキットcss（use.typekit.net）が @font-face を登録するまで最大3秒待つ
+          let faces = collectFaces();
+          for (let i = 0; i < 30 && faces.length === 0; i++) {
+            await new Promise(r => setTimeout(r, 100));
+            faces = collectFaces();
+          }
+          await Promise.all(faces.map(f => f.load().catch(() => {})));
+          await kick;
+          await document.fonts.ready;
+        }
+      } catch (e) {}
+    })();
+
+    // 互換フォールバック: document.fonts 非対応環境では隠しdivでも読み込ませる
+    if (!(document.fonts && document.fonts.load)) {
+      const hiddenFontDiv = document.createElement('div');
+      hiddenFontDiv.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;z-index:-1;font-family:fot-udkakugoc70-pro,fot-udkakugoc80-pro,sans-serif;';
+      hiddenFontDiv.innerHTML = `<span style="font-weight:400">${uniqueChars}</span><span style="font-weight:700">${uniqueChars}</span>`;
+      document.body && document.body.appendChild(hiddenFontDiv);
+    }
+
+    // 出演作品・人物名のプルダウンと「最新回を聴く」もデータから作る
+    // （編集ツールのプレビューで、ページを読み直さずにデータだけ取り直したときも作り直す）
+    refreshDataDrivenUI();
+    // 2回目以降の読み込みでも、新しく入れたキーワードが検索候補に出るよう作り直す
+    // （初回は initializeAutocomplete() がまだなので何もしない）
+    rebuildAutocompleteEntries();
     console.log("All data loaded successfully.");
+    return true;
   } catch (error) {
     console.error("Failed to load external data:", error);
     const resultsEl = document.getElementById('results');
     if (resultsEl) {
       resultsEl.innerHTML = '<li class="no-results">データの読み込みに失敗しました。<br>ページを再読み込みしてください。</li>';
     }
+    // フォントの読み込み待ち（データ読込後に作られる）を待たずに、すぐ画面を出す
+    window.__fontsReady = Promise.resolve();
+    return false;
   }
 }
 
-/**
- * データからアニメ作品名を抽出してプルダウンを作成する関数
- */
-function populateWorksFilter() {
-  const select = document.getElementById('worksSelect');
+function refreshDataDrivenUI() {
+  populateSelect('worksSelect', data.flatMap(ep => ep.worksList),
+    w => data.filter(ep => ep.worksList.includes(w)).length);
+  // パーソナリティ本人は全回に出ているので人物名の選択肢には入れない
+  populateSelect('personSelect', PERSON_LIST.filter(name => name !== PERSONALITY), name => {
+    const words = getPersonWords(name);
+    return data.filter(ep => words.some(w => ep.searchText.includes(w))).length;
+  });
+  setupLatestButton();
+  syncFilterSelects();
+}
+
+// 人物名の検索語（本名＋登録済みの愛称・読み）
+function getPersonWords(name) {
+  return [name, ...(CUSTOM_READINGS[name] || [])].map(normalize).filter(Boolean);
+}
+
+// 出演作品名・人物名のプルダウンを読み仮名の50音順で作る
+// （keywords.json / readings.json に読みがあれば1つ目の読みで並べる）。
+// countOf(label) で該当回数を数え、「名前（件数）」で表示する。0件の項目は選んでも
+// 何も出ないので選択肢に入れない
+function populateSelect(selectId, labels, countOf) {
+  const select = document.getElementById(selectId);
   if (!select) return;
-
-  const allWorks = data.flatMap(item => {
-    const target = item.works || item.anime;
-    const list = Array.isArray(target) ? target : (target ? [target] : []);
-    // 時間を削除してリスト化
-    return list.map(stripTimeSuffix);
-  });
-
-  const worksSet = new Set(allWorks.filter(name => name));
-
-  /* ▼▼▼ 追加・変更：読み仮名を取得して50音順にソート ▼▼▼ */
-  const getReading = (text) => {
-    // CUSTOM_READINGS (keywords.json や readings.json) に登録があれば、その1つ目の読みを使う
-    if (CUSTOM_READINGS[text] && CUSTOM_READINGS[text].length > 0) {
-      // 濁点・半角全角ブレなどを防ぐためにnormalizeしておく
-      return normalize(CUSTOM_READINGS[text][0]);
-    }
-    // 登録がなければそのままの文字列を返す
-    return normalize(text);
-  };
-
-  // 読み仮名同士で localeCompare を実行し、正しい50音順にする
-  const sortedWorks = Array.from(worksSet).sort((a, b) => {
-    return getReading(a).localeCompare(getReading(b), "ja");
-  });
-  /* ▲▲▲ 追加・変更ここまで ▲▲▲ */
-
-  while (select.options.length > 1) {
-    select.remove(1);
-  }
-
-  // ソートされた順にオプションを追加
-  sortedWorks.forEach(title => {
+  const reading = (text) => normalize((CUSTOM_READINGS[text] && CUSTOM_READINGS[text][0]) || text);
+  const sorted = [...new Set(labels.filter(Boolean))]
+    .map(label => ({ label, n: countOf(label) }))
+    .filter(x => x.n > 0)
+    .sort((a, b) => reading(a.label).localeCompare(reading(b.label), 'ja'));
+  while (select.options.length > 1) select.remove(1);
+  sorted.forEach(({ label, n }) => {
     const option = document.createElement('option');
-    option.value = title;
-    option.textContent = title;
+    option.value = label;
+    option.textContent = `${label}（${n}）`;
     select.appendChild(option);
   });
 }
 
-// ▼▼▼ ここから追加：人物名プルダウンの生成 ▼▼▼
-function populatePersonFilter() {
-  const select = document.getElementById('personSelect');
-  if (!select) return;
-
-  const getReading = (text) => {
-    // readings.jsonの配列の最初の要素（ひらがな）をソートの基準にする
-    if (CUSTOM_READINGS[text] && CUSTOM_READINGS[text].length > 0) {
-      return normalize(CUSTOM_READINGS[text][0]); // ★最後の要素から [0] に変更
-    }
-    return normalize(text);
-  };
-
-  const sortedPersons = [...PERSON_LIST].sort((a, b) => {
-    return getReading(a).localeCompare(getReading(b), "ja");
-  });
-
-  while (select.options.length > 1) {
-    select.remove(1);
-  }
-
-  sortedPersons.forEach(person => {
-    const option = document.createElement('option');
-    option.value = person;
-    option.textContent = person;
-    select.appendChild(option);
-  });
+// 「最新回を聴く」ボタン: いちばん新しいラジオ回（メン限動画は除く）のページを開く。
+// さーち・ざ・らじお！の「再生リスト作成」と同じ位置・見た目のボタン
+function setupLatestButton() {
+  const btn = document.getElementById('latestBtn');
+  if (!btn) return;
+  const toTime = (ep) => new Date(String(ep.date || '').replace(/\./g, '-')).getTime() || 0;
+  const latest = data
+    .filter(ep => ep.link && !ep.isMemberVideo && getEpisodeNumber(ep.episode) >= 0)
+    .sort((a, b) => toTime(b) - toTime(a) || getEpisodeNumber(b.episode) - getEpisodeNumber(a.episode))[0];
+  if (!latest) { btn.hidden = true; return; }
+  btn.href = latest.link;
+  const { num } = splitEpisodeTitle(latest.title);
+  btn.title = `最新回（${num || latest.title}）を開く`;
+  btn.hidden = false;
 }
-// ▲▲▲ ここまで追加 ▲▲▲
 
 async function initializeApp() {
-  const loadingScreen = document.getElementById('loading-screen');
-  const loadingLogo = document.getElementById('loading-logo'); 
+  const loaded = await loadExternalData();
 
-  try {
-    // 1. データの読み込み
-    await loadExternalData();
-
-    // 2. URLパラメータの復元
-    applyStateFromURL({ replace: true });
-
-    // 3. 各種セットアップ
-    populateWorksFilter();
-    populatePersonFilter(); // ★追加
-    formatYearButtons();
-    setupModals();
-    setupShareButtons();
-    setupRightClickModal();
-    setupThemeSwitcher();
-    initializeAutocomplete();
-    setupEventListeners();
-
-    // 4. 初回検索実行
-    search({ gotoPage: currentPage });
-
-  } catch (error) {
-    console.error("初期化中にエラーが発生しました:", error);
-    // エラー時でも画面操作ができるようにアラート等は出さずログのみ残す
-  } finally {
-    // 5. Adobe Fontsの準備完了を待ってからローディング画面を消す
-    if (loadingScreen) {
-      const earlyStyle = document.getElementById('early-theme-style');
-      if (earlyStyle) earlyStyle.textContent = ''; 
-
-      // ローディング画面をフェードアウトさせる共通関数
-      const hideLoadingScreen = () => {
-        // ★フェードアウトを開始するまでの「待機時間」を追加
-        // ここを 800 にすると、フォントが即座に読み込まれても最低0.8秒はロゴを表示します
-        setTimeout(() => {
-          loadingScreen.classList.add('fadeout');
-          
-          // フェードアウトのアニメーション（1秒）が終わったら要素を完全に消す
-          setTimeout(() => {
-            loadingScreen.style.setProperty('display', 'none', 'important');
-          }, 1000);
-          
-        }, 1000); // ← ★ここの数値を調整してください（1000 = 1秒、1500 = 1.5秒）
-      };
-
-      const htmlEl = document.documentElement;
-      
-      // 既にフォントの読み込みが完了している場合（wf-active か wf-inactive が付いている）
-      if (htmlEl.classList.contains('wf-active') || htmlEl.classList.contains('wf-inactive')) {
-        hideLoadingScreen();
-      } else {
-        // まだ読み込み中の場合は、完了の合図（クラス変更）を監視する
-        const observer = new MutationObserver((mutations, obs) => {
-          if (htmlEl.classList.contains('wf-active') || htmlEl.classList.contains('wf-inactive')) {
-            obs.disconnect(); // 監視を終了
-            hideLoadingScreen();
-          }
-        });
-        observer.observe(htmlEl, { attributes: true, attributeFilter: ['class'] });
-        
-        // 通信エラー等に備えた保険（最大3秒で強制的にローディングを消す）
-        setTimeout(() => {
-          observer.disconnect();
-          hideLoadingScreen();
-        }, 3000);
-      }
-    }
+  // 読み込みに失敗したときは、上のエラー表示を「一致する回が見つかりませんでした」で上書きしない
+  if (loaded && !applyStateFromURL({ replace: true })) {
+    search();
   }
+
+  setupEventListeners();
+  initializeAutocomplete();
+  setupThemeSwitcher();
+  setupModals();
+  setupShareButtons();
+  setupRightClickModal();
+  formatYearButtons();
+  updateHeaderOffset();
+  console.log("Application initialized.");
 }
 
-function preloadThumbsFromData() {
-  try {
-    const head = document.head;
-    const seen = new Set();
-    data.forEach(ep => {
-      const episodeFilename = ep.episode;
-      if (!episodeFilename || seen.has(episodeFilename)) return;
-      seen.add(episodeFilename);
-
-      const linkJpg = document.createElement('link');
-      linkJpg.rel = 'preload';
-      linkJpg.as = 'image';
-      linkJpg.href = `thumbnails/${episodeFilename}.jpg`;
-      head.appendChild(linkJpg);
-    });
-  } catch (e) {
-    console.error('Thumbnail preload error:', e);
-  }
-}
+/* ★削除: preloadThumbsFromData()
+ * 全サムネイル(約8MB)を起動直後に一括preloadしていたが、初回表示の帯域を圧迫し
+ * モバイルの通信量も浪費するため廃止。カード画像はloading="lazy"で必要時に読み込み、
+ * オフライン用の全件キャッシュはService Workerがバックグラウンドで1回だけ行う。 */
 
 /**
  * ===================================================
- * ★★★ 検索とフィルタリング ★★★
+ * ★★★ 検索とフィルタリング (コアロジック分離) ★★★
  * ===================================================
  */
 
+// 検索語を、登録した読み・別名（keywords.json / readings.json）で広げる。
+// （2文字以下の読みは、検索語がその読みそのもののときだけ使う）
+function expandSearchTerms(normalizedQuery, keysOnly) {
+  const searchTerms = new Set([normalizedQuery]);
+  // 2文字以下の検索は、読みの頭が合うときだけ使う（短い語が別の語の読みの途中に当たって、
+  // 関係ない回が出ないように）。3文字以上は途中でも当てる
+  const short = normalizedQuery.length <= 2;
+  const readingHit = (r) => short ? r.startsWith(normalizedQuery) : r.includes(normalizedQuery);
+  // ★性能: 起動時に正規化済みの READINGS_INDEX を使う
+  for (const entry of READINGS_INDEX) {
+    if (entry.normKey.includes(normalizedQuery) || entry.normReadings.some(readingHit)) {
+      searchTerms.add(entry.normKey);
+      if (!keysOnly) entry.normReadings.forEach(r => { if (r.length > 2 || r === normalizedQuery) searchTerms.add(r); });
+    }
+  }
+  return [...searchTerms].filter(Boolean);
+}
+
 function getFilteredData(query) {
-  let res = [...data];
-  
+  // 回番号が空のデータ（下書き等）は表示しない。お手元1 など番号のない回は表示する
+  let res = data.filter(it => getEpisodeNumber(it.episode) >= -1);
+
   const raw = query ? query.trim() : "";
-  
-  // ★修正: シンプルにエピソード番号のチェックのみにする
-  res = res.filter(it => getEpisodeNumber(it.episode) >= -1);
+  const normalizedRaw = normalize(raw);
 
-  
+  // メン限動画「育美のお手元」は通常の一覧（キーワードもフィルターも無い状態）には出さない。
+  // キーワード検索・カテゴリ／出演作品／人物の絞り込み・コーナー「育美のお手元」・
+  // お気に入り表示のときは、他の回と同じく表示する（さーち・ざ・らじお！の特殊回と同じ考え方）
+  const isDefaultList = raw.length === 0 && !selectedCategories.length && !selectedWorks && !selectedPerson
+    && !selectedCorners.includes(MEMBER_VIDEO_CORNER) && !showFavoritesOnly;
+  if (isDefaultList) res = res.filter(it => !it.isMemberVideo);
 
-  const rangeMatch = raw.match(/^(\d+)\s+(\d+)$/);
-  if (rangeMatch) {
+  // 「#43」「第43回 ぼっち」はその回だけを返す（「#1」が#10〜#19まで拾う部分一致を防ぐ）
+  const epQuery = parseEpisodeQuery(raw);
+  const rangeMatch = !epQuery && raw.match(/^(\d+)\s+(\d+)$/);
+  if (epQuery) {
+    res = res.filter(it => getEpisodeNumber(it.episode) === epQuery.ep);
+  } else if (rangeMatch) {
     let num1 = parseInt(rangeMatch[1], 10);
     let num2 = parseInt(rangeMatch[2], 10);
     const minNum = Math.min(num1, num2);
@@ -717,69 +930,44 @@ function getFilteredData(query) {
       const epNum = getEpisodeNumber(it.episode);
       return epNum >= minNum && epNum <= maxNum;
     });
+  } else if (raw.length > 0 && ALL_EPISODES_TERMS.has(normalizedRaw)) {
+    // ★パーソナリティ本人の検索: 絞り込みを行わず、全エピソードをそのまま返す
+    // （この後のカテゴリ・年などのフィルターは通常どおり適用される）
   } else if (raw.length > 0) {
     const normalizedQuery = normalize(raw);
-    const searchTerms = new Set([normalizedQuery]);
-    for (const key in CUSTOM_READINGS) {
-        if (normalize(key).includes(normalizedQuery) || CUSTOM_READINGS[key].some(r => normalize(r).includes(normalizedQuery))) {
-            searchTerms.add(normalize(key));
-            CUSTOM_READINGS[key].forEach(r => searchTerms.add(normalize(r)));
-        }
-    }
-    const searchWords = [...searchTerms].filter(Boolean);
-    res = res.filter(it => searchWords.some(word => it.searchText.includes(word)));
+    const searchWords = expandSearchTerms(normalizedQuery);
+    // コーナーの中身（フォトメモリーの話題・どこから？の作品名）は、入力した語と、
+    // 読みから当たった登録済みの表記で探す（読みそのものは使わない。さーち・ざ・らじお！と同じ）
+    const cornerWords = expandSearchTerms(normalizedQuery, true);
+    // サイト側キーワードに加え、ユーザーが登録したタイムスタンプのメモも検索対象にする
+    res = res.filter(it => searchWords.some(word => it.searchText.includes(word)) ||
+      (it.cornerTexts || []).some(c => cornerWords.some(word => c.norm.includes(word))) ||
+      matchesUserMemo(it, searchWords));
   }
 
-  // 出演作品フィルタ
-  if (selectedWorks) {
-    res = res.filter(it => {
-      const works = Array.isArray(it.works) ? it.works : [it.works || ""];
-      // ★ここを変更：データの作品名から時間を除外して、選択された作品名と一致するか確認
-      return works.some(w => stripTimeSuffix(w) === selectedWorks);
-    });
-  }
-
-  // ▼▼▼▼▼ 修正箇所: カテゴリフィルタ（配列対応版） ▼▼▼▼▼
-  if (selectedCategories.length) {
-      res = res.filter(it => {
-          return selectedCategories.some(cat => {
-              // データ側のカテゴリを取得（配列化して統一）
-              const itemCats = Array.isArray(it.category) ? it.category : [it.category];
-              
-              // カテゴリ配列の中に、選択されたカテゴリ(cat)が含まれているかのみで判定
-              return itemCats.includes(cat);
-          });
-      });
-  }
-
-  // ゲストフィルタ
-  if (selectedGuests.length) {
-    res = res.filter(it => selectedGuests.some(g => it.searchText.includes(normalize(g))));
-  }
-
-  // ▼▼▼ 追加：人物名フィルタ（本名やあだ名が含まれていればヒット） ▼▼▼
+  // カテゴリ: episodes.json の category 配列に含まれるかで判定（複数選択はOR）
+  if (selectedCategories.length) res = res.filter(it => selectedCategories.some(c => it.categories.includes(c)));
+  // 出演作品: works の作品名（@時刻を除いたもの）と完全一致
+  if (selectedWorks) res = res.filter(it => it.worksList.includes(selectedWorks));
+  // 人物名: 本名または登録済みの愛称・読みがどこかに含まれていればヒット
   if (selectedPerson) {
-    const searchWords = [normalize(selectedPerson)];
-    if (CUSTOM_READINGS[selectedPerson]) {
-      CUSTOM_READINGS[selectedPerson].forEach(r => searchWords.push(normalize(r)));
-    }
-    res = res.filter(it => searchWords.some(word => it.searchText.includes(word)));
+    const personWords = getPersonWords(selectedPerson);
+    res = res.filter(it => personWords.some(w => it.searchText.includes(w)));
   }
-  // ▲▲▲ 追加 ▲▲▲
-
-  // コーナーフィルタ
   if (selectedCorners.length) res = res.filter(it => selectedCorners.some(c => it.searchText.includes(normalize(c))));
-  
-
-  // 年フィルタ
   if (selectedYears.length) res = res.filter(it => selectedYears.includes(String(it.date).slice(0, 4)));
-  
-  // お気に入りフィルタ
-  if (showFavoritesOnly) res = res.filter(it => isFavorite(getVideoId(it.link)));
+  if (showFavoritesOnly) res = res.filter(it => isFavorite(it.favId));
 
   return res;
 }
 
+// 登録済みの検索語（キーワード・出演者・読み仮名・ローマ字形）と完全一致するか。
+// 「もしかして」バーを完全一致の検索では出さない判定に使う
+function isRegisteredSearchTerm(normQuery) {
+  return !!(window.searchCorpus && window.searchCorpus.has(normQuery));
+}
+
+// ★修正: search関数
 function search(opts = {}) {
   isSearchTriggered = true;
   if (typeof clearAutocompleteSuggestions === 'function') clearAutocompleteSuggestions();
@@ -792,17 +980,35 @@ function search(opts = {}) {
 
   let res = getFilteredData(rawQuery);
   let suggestionWords = [];
+  // 「もしかして」バーの表示ルール:
+  //  - 検索が0件 → 表示（一番近い候補の結果を代わりに出す）
+  //  - ヒットはあるが、登録キーワード・読み仮名と完全一致しない入力（一部だけの入力）→ 表示
+  //  - 登録キーワードそのもの（完全一致）→ 非表示（邪魔になるだけ）
+  let showDidYouMean = false;
 
-  if (rawQuery.length > 0) {
+  if (rawQuery.length > 0 && !parseEpisodeQuery(rawQuery)) {
      const suggestions = findDidYouMean(rawQuery);
+
      if (suggestions.length > 0) {
-       const validSuggestions = suggestions.filter(word => getFilteredData(word).length > 0);
-       if (validSuggestions.length > 0) {
-         if (res.length === 0) {
+       if (res.length === 0) {
+         // ヒット0件: 一番近い候補の結果を代わりに表示し、「もしかして」で他候補も提示する
+         const validSuggestions = suggestions.filter(word => getFilteredData(word).length > 0);
+         if (validSuggestions.length > 0) {
            res = getFilteredData(validSuggestions[0]);
            suggestionWords = validSuggestions;
-         } else {
-           suggestionWords = validSuggestions;
+           showDidYouMean = true;
+         }
+       } else {
+         // 直接ヒットあり: 候補語はカードの時刻リンク解決
+         // （読み仮名入力→正式キーワードの@時刻を見つける）に使うため常に保持する
+         suggestionWords = suggestions;
+         // 完全一致でない「一部だけの入力」なら、完全なキーワードをバーで提案する
+         if (!isRegisteredSearchTerm(normalize(rawQuery))) {
+           const validSuggestions = suggestions.filter(word => getFilteredData(word).length > 0);
+           if (validSuggestions.length > 0) {
+             suggestionWords = validSuggestions;
+             showDidYouMean = true;
+           }
          }
        }
      }
@@ -821,34 +1027,40 @@ function search(opts = {}) {
   const countEl = document.getElementById('fixedResultsCount');
   countEl.innerHTML = `表示数：<span class="impact-number">${res.length}</span>件`;
 
-  currentPage = opts.gotoPage || 1;
+  // ページ番号は必ず結果の総ページ数の範囲内に収める
+  // （URLの ?p= に過大な値が入っていても空ページにならない）
+  const totalPage = Math.max(1, Math.ceil(res.length / pageSize));
+  currentPage = Math.min(Math.max(1, opts.gotoPage || 1), totalPage);
   if (!isRestoringURL) buildURLFromState({ method: 'push' });
 
-  renderResults(res, currentPage, rawQuery, suggestionWords);
+  renderResults(res, currentPage, rawQuery, suggestionWords, showDidYouMean);
   renderPagination(res.length);
   updateActiveFilters();
 }
 
+// プルダウン（出演作品・人物）の表示を選択状態に合わせる
+function syncFilterSelects() {
+  const worksSelect = document.getElementById('worksSelect');
+  const personSelect = document.getElementById('personSelect');
+  if (worksSelect) {
+    // URLから未知の作品名が来た場合でも選択肢に無ければ未選択表示に戻す
+    worksSelect.value = selectedWorks;
+    if (worksSelect.value !== selectedWorks) worksSelect.value = '';
+    worksSelect.classList.toggle('active', !!selectedWorks);
+  }
+  if (personSelect) {
+    personSelect.value = selectedPerson;
+    if (personSelect.value !== selectedPerson) personSelect.value = '';
+    personSelect.classList.toggle('active', !!selectedPerson);
+  }
+}
+
 function resetFilters() {
-  selectedCategories = []; 
-  selectedGuests = []; 
+  selectedCategories = [];
   selectedCorners = [];
   selectedYears = [];
-
-  selectedWorks = ""; 
-  const worksSelect = document.getElementById('worksSelect');
-  if (worksSelect) {
-    worksSelect.value = ""; 
-  }
-
-  // ▼▼▼ 追加：人物名のリセット ▼▼▼
-  selectedPerson = ""; 
-  const personSelect = document.getElementById('personSelect');
-  if (personSelect) {
-    personSelect.value = ""; 
-  }
-  // ▲▲▲ 追加 ▲▲▲
-
+  selectedWorks = "";
+  selectedPerson = "";
   updateFilterButtonStyles();
   search();
 }
@@ -856,13 +1068,14 @@ function resetFilters() {
 function resetSearch() {
   const searchBox = document.getElementById('searchBox');
   const sortSelect = document.getElementById('sortSelect');
-  if (searchBox) searchBox.value = "";
-  document.getElementById('searchBox').dispatchEvent(new Event('input'));
+  if (searchBox) {
+    searchBox.value = "";
+    searchBox.dispatchEvent(new Event('input'));
+  }
   if (sortSelect) sortSelect.value = "newest";
 
   if (showFavoritesOnly) {
-    favorites.clear();
-    saveFavs();
+    // ★変更: 登録データ（タイムスタンプ）は消さず、絞り込みモードだけを解除する
     showFavoritesOnly = false;
     document.body.classList.remove('fav-only');
     const favBtn = document.getElementById("favOnlyToggleBtn");
@@ -870,31 +1083,83 @@ function resetSearch() {
       favBtn.classList.remove("active");
       favBtn.setAttribute("aria-pressed", "false");
     }
-    document.querySelectorAll("#results .fav-btn.active").forEach(btn => {
-      btn.classList.remove("active");
-      const icon = btn.querySelector("i");
-      if (icon) {
-        icon.classList.remove("fa-solid");
-        icon.classList.add("fa-regular");
-      }
-    });
   }
 
   resetFilters();
   try { window.scrollTo({ top: 0, behavior: 'auto' }); } catch (e) { window.scrollTo(0, 0); }
-  if (typeof window.toggleFilterDrawer === 'function') window.toggleFilterDrawer(false);
+
+  if (typeof window.toggleFilterDrawer === 'function') {
+    window.toggleFilterDrawer(false);
+  }
   document.getElementById('mainResetBtn')?.blur();
+
+  // ★追加: リセットボタンを押した際に、サイトの最新版がないかチェックする
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistration().then(reg => {
+      if (reg) {
+        // 更新があればダウンロードを開始し、完了次第 index.html 側でリロードされる
+        reg.update();
+      }
+    });
+
+    // ★強制反映: reg.update() は CDN（GitHub Pagesは約10分キャッシュ）から
+    // 古い sw.js を掴んで「更新なし」と誤判定することがあり、PWAでは更新が
+    // なかなか反映されなかった。毎回ユニークなクエリでCDNキャッシュを確実に
+    // 回避して最新の sw.js を取得し、バージョンが現在と異なる時だけ
+    // そのバージョン名のURLで再登録する（新しいURL＝確実に新SWとして
+    // インストールされ、controllerchange経由でスプラッシュ付き自動リロードされる。
+    // 再登録URLは新しいindex.htmlが登録するURLと同じ形式なので以後も一本化される）。
+    fetch('sw.js?nocache=' + Date.now(), { cache: 'no-store' })
+      .then(res => res.ok ? res.text() : null)
+      .then(async txt => {
+        if (!txt || !('caches' in window)) return;
+        const m = txt.match(/SW_VERSION\s*=\s*'([^']+)'/);
+        if (!m || !m[1]) return;
+        // 現在稼働中のバージョンは、SWが作るキャッシュ名（hasegawa-ikumi-cache-<ver>。sw.js の CACHE_PREFIX と合わせる）から判定する。
+        // （バージョン表記をsw.jsの1箇所に集約したため、ページ側には埋め込まれていない）
+        const keys = await caches.keys().catch(() => []);
+        if (!keys.includes(`hasegawa-ikumi-cache-${m[1]}`)) {
+          // ★強制反映の保険付き: 通常は新SWのactivate→controllerchangeで自動リロード
+          // されるが、万一そのイベントが来ない環境でも、新SWが有効化されたのを
+          // 見届けてから必ずリロードして更新を反映する（二重リロードは
+          // controllerchange側が先に走れば本タイマーはページごと破棄されるため起きない）
+          navigator.serviceWorker.register('sw.js?' + m[1]).then(reg => {
+            const w = reg.installing || reg.waiting;
+            if (!w) return;
+            w.addEventListener('statechange', () => {
+              if (w.state === 'activated') {
+                setTimeout(() => {
+                  if (window.__showSplashCover) { try { window.__showSplashCover(); } catch (e) {} }
+                  window.location.reload();
+                }, 400);
+              }
+            });
+          }).catch(() => {});
+        }
+      })
+      .catch(() => {}); // オフライン等は無視（通常のリセット動作は既に完了している）
+  }
 }
 
+/* =================================================== */
+/* ★★★ 新規: 検索条件を残したままトップへ戻る ★★★ */
+/* =================================================== */
 function exitFavoritesMode() {
+  // お気に入りフラグだけを下ろす
   showFavoritesOnly = false;
   document.body.classList.remove('fav-only');
+  
+  // お気に入りトグルボタンの見た目を戻す
   const favBtn = document.getElementById("favOnlyToggleBtn");
   if (favBtn) {
     favBtn.classList.remove("active");
     favBtn.setAttribute("aria-pressed", "false");
   }
+  
+  // 検索条件（キーワードや絞り込み）は消さずに再検索を実行
   search();
+  
+  // 画面トップへスクロール
   try { window.scrollTo({ top: 0, behavior: 'auto' }); } catch (e) { window.scrollTo(0, 0); }
 }
 
@@ -913,200 +1178,267 @@ function formatYearButtons() {
   });
 }
 
-function renderResults(arr, page = 1, originalQuery = null, suggestions = []) {
+// ★修正: renderResults (もっと見る機能 + 自動フォント調整)
+// カードの★アイコンと件数バッジをタイムスタンプ登録状況に同期する
+function updateFavStar(li) {
+  const favBtn = li.querySelector('.fav-btn');
+  if (!favBtn) return;
+  const count = getTimestamps(favBtn.dataset.id).length;
+  const active = count > 0;
+  li.classList.toggle('is-fav', active);
+  favBtn.classList.toggle('active', active);
+  const icon = favBtn.querySelector('i');
+  icon.classList.toggle('fa-solid', active);
+  icon.classList.toggle('fa-regular', !active);
+  const badge = favBtn.querySelector('.fav-count');
+  if (badge) {
+    // 100件以上は「99+」表示にして、バッジが★ボタンを覆い尽くすのを防ぐ
+    badge.textContent = count > 99 ? '99+' : count;
+    badge.hidden = !active;
+  }
+}
+
+// カード見出し: 上段＝回番号（「第89回」）、下段＝サブタイトル（「激重感情ヘアです」等）。
+// コーナー（フォトメモリー／どこから？）で検索・絞り込み中は、下段をその回のコーナーの中身に差し替える
+// （さーち・ざ・らじお！の CORNER_TEXTS と同じ考え方）。opts.textCorners: 差し替えるコーナー（CORNER_TEXTS の要素）。
+// 複数のときは、その回に中身があるコーナーのうち CORNER_TEXTS の並びで先のもの。中身が無い回はいつもの表示
+function getEpisodeHeading(it, opts = {}) {
+  const { num, rest } = splitEpisodeTitle(it.title);
+  let sub = decodeEntities(rest);
+  for (const c of (opts.textCorners || [])) {
+    const text = cornerTextOf(c, it.episode);
+    if (text) { sub = text; break; }
+  }
+  return num ? { num, sub } : { num: decodeEntities(it.title), sub: '' };
+}
+
+// エピソードカードのリンク部分（サムネイル＋見出し＋公開日時・再生時間）。
+// 検索結果とタイムスタンプモーダルのカードで共用する
+function buildEpisodeCardLink(it, { href, hit = null, heading, hasPhotoBtn = false } = {}) {
+  const h = heading || getEpisodeHeading(it);
+  const numHtml = impactifyHtml(h.num, /(\d+)/);
+  const sub = escapeHtml(h.sub);
+  return `
+  <a href="${escapeHtml(href || it.link)}" target="_blank" rel="noopener" style="display:flex;text-decoration:none;color:inherit;align-items:center;min-width:0;">
+    <div class="thumb-col">
+      <img src="thumbnails/${encodeURIComponent(it.episode)}.jpg" class="thumbnail" alt="サムネイル：${escapeHtml(h.num)}"
+           loading="lazy" decoding="async"
+           onload="this.classList.add('loaded')"
+           onerror="this.onerror=null; this.src='./thumb-fallback.svg'; this.classList.add('loaded');">
+      ${hit ? `<div class="ts-buttons"><button class="ts-btn" data-url="${escapeHtml(it.link)}" aria-label="${hit.label} の場面（エピソードを開く）"><span class="impact-number">${hit.label}</span></button></div>` : ''}
+    </div>
+    <div style="min-width:0;">
+      <div class="d-flex align-items-start justify-content-between" style="min-width:0;">
+        <h5 class="mb-1"${h.sub ? ` title="${escapeHtml(h.num + ' ' + h.sub)}"` : ''}>
+          ${numHtml}${sub ? '<br>' : ' '}
+          <span class="guest-one-line${/^[「『（【〈《〔［｛]/.test(h.sub) ? ' starts-bracket' : ''}" aria-label="${sub}">${sub}</span>
+        </h5>
+      </div>
+      <div class="episode-meta ${hasPhotoBtn ? 'has-photo-btn' : ''}">
+        <div class="meta-one-line" style="visibility: hidden;">公開日時：<span class="impact-number">${escapeHtml(it.date || '')}</span></div>
+        <div class="meta-one-line" style="visibility: hidden;">再生時間：${(it.duration ? `<span class="impact-number">${escapeHtml(it.duration)}</span>` : '?')}</div>
+      </div>
+    </div>
+  </a>`;
+}
+
+function renderResults(arr, page = 1, originalQuery = null, suggestions = [], showDidYouMean = false) {
   const ul = document.getElementById("results");
+  // カード出現アニメーションは毎回再生する（タップした手応えとして必要、という要望）。
+  // 空白時間が長くならないよう、段差ディレイの上限はCSS側で制限している。
   ul.innerHTML = "";
 
   if (showFavoritesOnly) {
     const liFav = document.createElement('li');
     liFav.className = 'favorites-title-header';
     liFav.style.gridColumn = "1 / -1";
+    
+    // ★タイトルとボタンをセットで表示（お気に入りがある時だけ一括削除ボタンも出す）
+    const hasFavorites = Object.keys(timestamps).length > 0;
     liFav.innerHTML = `
       <div class="favorites-header-layout">
-        <div class="favorites-title-inner"><span>★お気に入り★</span></div>
-        <button id="favGoHomeBtn" class="fav-home-btn"><i class="fa-solid fa-rotate-left"></i> トップへ戻る</button>
-      </div>`;
+        <div class="favorites-title-inner">
+          <span>★お気に入り★</span>
+        </div>
+        <div class="fav-header-actions">
+          <button id="favGoHomeBtn" class="fav-home-btn">
+            <i class="fa-solid fa-rotate-left"></i> トップへ戻る
+          </button>
+          ${hasFavorites ? `
+          <button id="favClearAllBtn" class="fav-clear-btn" aria-label="お気に入りをすべて削除">
+            <i class="fa-solid fa-trash-can"></i> すべて削除
+          </button>` : ''}
+        </div>
+        ${hasFavorites ? `
+        <div id="favClearConfirm" class="ts-clear-confirm fav-clear-confirm" hidden role="alertdialog" aria-labelledby="favClearConfirmText">
+          <p id="favClearConfirmText" class="ts-clear-confirm-text">すべてのお気に入りと登録済みタイムスタンプを削除します。<span class="ts-clear-confirm-q">よろしいですか？</span></p>
+          <div class="ts-clear-confirm-actions">
+            <button id="favClearCancelBtn" class="ts-clear-cancel-btn">キャンセル</button>
+            <button id="favClearOkBtn" class="ts-clear-ok-btn"><i class="fa-solid fa-trash-can"></i><span>すべて削除</span></button>
+          </div>
+        </div>` : ''}
+      </div>
+    `;
     ul.appendChild(liFav);
   }
 
-  if (suggestions && suggestions.length > 0 && originalQuery) {
+  if (showDidYouMean && suggestions && suggestions.length > 0 && originalQuery) {
     const li = document.createElement('li');
-    li.className = 'did-you-mean-alert'; 
+    li.className = 'did-you-mean-alert';
     li.style.gridColumn = "1 / -1"; 
+
     const limit = 5; 
     const showAll = suggestions.length <= limit;
     const firstBatch = suggestions.slice(0, limit);
     const hiddenBatch = suggestions.slice(limit);
 
+    // ボタン生成用ヘルパー
+    // ★修正: 初期状態を opacity: 0 (透明) に設定して、調整前のガタつきを隠す
+    // ★セキュリティ修正: インラインonclickへの文字列連結をやめ、data属性＋イベント委譲に変更
+    //   （検索語に引用符やHTML特殊文字が含まれても壊れず、スクリプト注入もできない）
     const createBtn = (word) => `
-      <button class="dym-word-btn" style="margin: 4px; opacity: 0;" onclick="document.getElementById('searchBox').value='${word}'; search(); scrollToResultsTop();">
-        ${word}
-      </button>`;
+      <button class="dym-word-btn" data-word="${escapeHtml(word)}" style="margin: 4px; opacity: 0;">
+        ${escapeHtml(word)}
+      </button>
+    `;
 
+    // 最初のボタンたち
     let buttonsHtml = firstBatch.map(createBtn).join('');
+
+    // 隠れている分がある場合の「もっと見る」ボタンと隠しエリア
     if (!showAll) {
+      // 「もっと見る」ボタン自体は調整不要なので opacity: 1 でOK（またはクラス指定に従う）
       buttonsHtml += `
-        <button id="dymShowMoreBtn" class="dym-word-btn" style="margin: 4px; background: transparent; border: 1px dashed currentColor; opacity: 0.8;" onclick="document.getElementById('dymHiddenArea').style.display='inline'; this.style.display='none'; fitDymButtons();">
+        <button id="dymShowMoreBtn" class="dym-word-btn" style="margin: 4px; background: transparent; border: 1px dashed currentColor; opacity: 0.8;">
           <i class="fa-solid fa-plus"></i> 他${hiddenBatch.length}件
         </button>
-        <span id="dymHiddenArea" style="display:none;">${hiddenBatch.map(createBtn).join('')}</span>`;
+        <span id="dymHiddenArea" style="display:none;">
+          ${hiddenBatch.map(createBtn).join('')}
+        </span>
+      `;
     }
+
     li.innerHTML = `
-      <div class="dym-alert-content"><div class="dym-alert-main"><span class="dym-prefix"><i class="fa-regular fa-lightbulb"></i> もしかして：</span>
-      <div style="display:inline-block; text-align: center;">${buttonsHtml}</div></div></div>`;
+      <div class="dym-alert-content">
+        <div class="dym-alert-main">
+          <span class="dym-prefix"><i class="fa-regular fa-lightbulb"></i> もしかして：</span>
+          <div style="display:inline-block; text-align: center;">
+            ${buttonsHtml}
+          </div>
+        </div>
+      </div>
+    `;
     ul.appendChild(li);
   }
 
   if (!arr || arr.length === 0) {
-    ul.innerHTML += '<li class="no-results"><div class="no-results-content"><div class="no-results-icon"><i class="fa-solid fa-circle-exclamation"></i>一致する回が見つかりませんでした。</div></div></li>'; 
+    // 0件のときは、状況に合わせた言い換えのヒントを出す
+    const hasQuery = !!document.getElementById('searchBox').value.trim();
+    // お気に入り表示のときのヒント文はなし
+    const hint = showFavoritesOnly
+      ? ''
+      : hasQuery
+        ? '言葉を短くするか、ひらがなや別の呼び方で検索してみてください。'
+        : '絞り込みの条件を減らしてみてください。';
+    let html = '<li class="no-results"><div class="no-results-content"><div class="no-results-icon"><i class="fa-solid fa-circle-exclamation"></i>一致する回が見つかりませんでした。</div>';
+    if (hint) html += `<p class="no-results-hint">${hint}</p>`;
+    html += '</div></li>';
+    ul.innerHTML += html; // append to existing header (if any)
     return;
   }
 
+  // 4. 結果リストの描画
   const startIdx = (page - 1) * pageSize;
   const endIdx = page * pageSize;
   
+  // ★修正: ユーザーの入力(userQuery)とサジェスト(suggestionQuery)を分けて取得
   const userQuery = document.getElementById('searchBox').value.trim();
   const suggestionQuery = (suggestions.length > 0) ? suggestions[0] : null;
-  const cornerTarget = selectedCorners.length === 1 ? selectedCorners[0] : null;
+  // 「#43 ぼっち」形式なら、時刻リンクは番号を除いたキーワード部分で探す
+  const epQueryInResults = parseEpisodeQuery(userQuery);
+  const timeQuery = epQueryInResults ? epQueryInResults.rest : userQuery;
+  // 読み仮名で入力された時（「ふぉとめもりー」「#36 よみ」等）は正式表記でも時刻を探す
+  // （番号つきの検索では候補を使わないので、読みのままだと時刻が付かなかった）
+  const canonicalQuery = READING_TO_LABEL[normalize(timeQuery)] || null;
 
-  // ■ フォトメモリーモード判定
-  const isPhotoMemoryMode = selectedCorners.includes("フォトメモリー") || userQuery.includes("フォトメモリー");
+  // コーナー判定などにはサジェストがあればそちらを使う（既存ロジック維持）
+  const highlightQuery = suggestionQuery || userQuery;
+
+  // コーナー名での絞り込み・検索中かどうか（見出しの差し替え表示に使う）
+  const isCornerMode = (corner) => {
+    if (selectedCorners.includes(corner)) return true;
+    const nc = normalize(corner);
+    return [highlightQuery, userQuery, canonicalQuery].some(q => q && normalize(q).includes(nc));
+  };
+  const headingOpts = { textCorners: CORNER_TEXTS.filter(c => isCornerMode(c.corner)) };
 
   const fragment = document.createDocumentFragment();
 
-arr.slice(startIdx, endIdx).forEach((it, index) => {
-    // 1. タイムスタンプ判定
-    let hit = findHitTime(it, userQuery);
-    if (!hit && suggestionQuery) hit = findHitTime(it, suggestionQuery);
-    if (!hit && userQuery) {
-      const normUserQuery = normalize(userQuery);
-      const canonical = READING_TO_LABEL[normUserQuery];
-      if (canonical) hit = findHitTime(it, canonical);
-    }
-    if (!hit && cornerTarget) hit = findHitTime(it, cornerTarget);
-    if (!hit && selectedWorks) {
-      const works = Array.isArray(it.works) ? it.works : [it.works || ""];
-      const targetWork = works.find(w => stripTimeSuffix(w) === selectedWorks);
-      if (targetWork) hit = parseKeywordTime(targetWork);
-    }
+  arr.slice(startIdx, endIdx).forEach((it, index) => {
+    const favId = it.favId;
+    const heading = getEpisodeHeading(it, headingOpts);
 
-    // 人物名フィルタ時のタイムスタンプ判定 ▼▼▼
-    if (!hit && selectedPerson) {
-      // 本名で探す
-      hit = findHitTime(it, selectedPerson);
-      // 見つからなければ、あだ名・別名でも探す
-      if (!hit && CUSTOM_READINGS[selectedPerson]) {
-        for (const alias of CUSTOM_READINGS[selectedPerson]) {
-          hit = findHitTime(it, alias);
-          if (hit) break;
-        }
+    // ★修正: まずユーザーの入力そのものでタイムスタンプを探す
+    let hit = findHitTime(it, timeQuery);
+
+    // ★修正: ヒットせず、もしサジェストがあるなら、そちらでも探す
+    if (!hit && suggestionQuery) {
+      hit = findHitTime(it, suggestionQuery);
+    }
+    if (!hit && canonicalQuery) {
+      hit = findHitTime(it, canonicalQuery);
+    }
+    // 読み・別名で見つかった回は、その別名の話の時刻を出す
+    if (!hit && timeQuery) hit = findAliasHitTime(it, timeQuery);
+    if (!hit && selectedCorners.length > 0) {
+      for (const corner of selectedCorners) {
+        hit = findHitTime(it, corner);
+        if (hit) break;
       }
     }
-
-    const finalLink = hit ? withTimeParam(it.link, hit.seconds) : it.link;
-    const episodeFilename = it.episode;
-    const thumbUrlJpg = `thumbnails/${episodeFilename}.jpg`;
-
-    // 2. タイトルの分割ロジック（ここが重要）
-    // 「第2回」と「タイトル」を正しく分けます
-    const splitMatch = it.title.match(/^((?:第\d+回|#\S+))\s*(.*)$/);
-    let epNumStr = "";
-    let titleStr = it.title; // デフォルトは全体
-    
-    if (splitMatch) {
-        epNumStr = splitMatch[1];
-        titleStr = splitMatch[2]; // これが「ROCK INで...」の部分です
+    // 出演作品・人物名で絞り込み中は、その作品／人物（愛称含む）の時刻を探す
+    if (!hit && selectedWorks) {
+      hit = findHitTime(it, selectedWorks);
     }
-
-    // 3. エピソードラベルのHTML生成 (V5デザイン対応)
-    let epLabelHtml = "";
-    if (epNumStr) {
-        // 数字部分だけフォントを変える処理
-        const formattedNum = epNumStr.replace(/(\d+)/g, '<span class="num-text">$1</span>');
-        epLabelHtml = `<span class="ep-label">${formattedNum}</span>`;
+    if (!hit && selectedPerson) {
+      for (const name of [selectedPerson, ...(CUSTOM_READINGS[selectedPerson] || [])]) {
+        hit = findHitTime(it, name);
+        if (hit) break;
+      }
     }
-
-    // 4. フォトメモリー/お気に入りボタン判定
-    const isMode = selectedCorners.includes("フォトメモリー") || (userQuery && userQuery.includes("フォトメモリー"));
-    const pmData = (isMode && typeof photoMemoryData !== 'undefined') ? photoMemoryData[it.episode] : null;
-
-    /* ▼▼▼ フォトメモリーモードかつタイトル定義があれば差し替え ▼▼▼ */
-    if (pmData && pmData.title) {
-        titleStr = pmData.title;
-    }
-
-    /* ▼▼▼ 「あなたの長谷川育美はどこから？」モードの判定 ▼▼▼ */
-    const dokokaraKey = "あなたの長谷川育美はどこから？";
-    // フィルタ選択中 または キーワード検索に含まれている場合
-    const isDokokaraMode = selectedCorners.includes(dokokaraKey) || (userQuery && userQuery.includes(dokokaraKey));
-    const dkItem = (isDokokaraMode && typeof dokokaraData !== 'undefined') ? dokokaraData[it.episode] : null;
-
-    // データがあり、タイトルが定義されていれば上書き
-    if (dkItem && dkItem.title) {
-        titleStr = dkItem.title;
-    }
-
-    let actionBtnHtml = "";
-    if (pmData && pmData.links && pmData.links.length > 0) {
-        const linksJson = JSON.stringify(pmData.links).replace(/"/g, '&quot;');
-        actionBtnHtml = `<button class="photo-link-btn" onclick="openPhotoLinksModal(this)" data-links="${linksJson}"><i class="fa-solid fa-camera"></i></button>`;
-    } else {
-        const activeClass = isFavorite(it.link) ? ' active' : '';
-        const iconType = isFavorite(it.link) ? 'fa-solid' : 'fa-regular';
-        actionBtnHtml = `<button class="fav-btn${activeClass}" data-id="${it.link}" aria-label="お気に入り"><i class="${iconType} fa-star"></i></button>`;
-    }
-
-    // 5. カードHTML生成 (ここを大幅に変更しました)
     const li = document.createElement('li');
     li.className = 'episode-item';
     li.setAttribute('role', 'link');
     li.tabIndex = 0;
     li.style.setProperty('--i', index.toString());
 
-    // ▼ CSSの .text-col, .meta-header, .card-title クラスを使用する構造に変更
-    li.innerHTML = `
-      <a href="${finalLink}" target="_blank" rel="noopener">
-        <div class="thumb-col">
-          <img src="${thumbUrlJpg}" class="thumbnail" alt="${it.title}" 
-               decoding="async" 
-               onload="this.classList.add('loaded')"
-               onerror="this.onerror=null; this.src='./thumb-fallback.svg'; this.classList.add('loaded');">
-          ${hit ? `<div class="ts-buttons"><button class="ts-btn" data-url="${it.link}" data-ts="${hit.seconds}"><span class="impact-number">${hit.label}</span></button></div>` : ''}
-        </div>
-        
-        <div class="text-col">
-          <div class="meta-header">
-            ${epLabelHtml}
-            <span class="meta-item meta-date"><i class="fa-regular fa-calendar"></i> <span class="impact-number">${it.date}</span></span>
-            <span class="meta-item meta-duration"><i class="fa-regular fa-clock"></i> <span class="impact-number">${it.duration}</span></span>
-          </div>
-          <h3 class="card-title">${titleStr}</h3>
-        </div>
-      </a>
-      ${actionBtnHtml}
-    `;
-    
-    if (isFavorite(it.link) && !pmData) {
-      li.classList.add('is-fav');
+    // フォトメモリーのリンク（Xの投稿など）がある回はカメラボタンを出す
+    let photoBtnHtml = '';
+    const pm = photoMemoryData[it.episode];
+    const hasPhotoBtn = !!(pm && Array.isArray(pm.links) && pm.links.length > 0);
+    if (hasPhotoBtn) {
+      photoBtnHtml = `<button class="photo-btn" data-ep="${escapeHtml(it.episode)}" aria-label="フォトメモリンク" title="フォトメモリンク"><i class="fa-solid fa-camera"></i></button>`;
     }
+
+    li.innerHTML = `
+  ${buildEpisodeCardLink(it, { hit, heading, hasPhotoBtn })}
+  ${photoBtnHtml}
+  <button class="fav-btn" data-id="${escapeHtml(favId || '')}" data-link="${escapeHtml(it.link || '')}" data-title="${escapeHtml(heading.num)}" data-duration="${escapeHtml(it.duration || '')}" aria-label="タイムスタンプ" title="タイムスタンプ"><i class="fa-regular fa-star"></i><span class="fav-count" hidden></span></button>
+`;
+    
+    updateFavStar(li);
     fragment.appendChild(li);
   });
 
   ul.appendChild(fragment);
 
+  // ★修正: 描画後にボタンのサイズ調整を行う
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
         fitGuestLines();
-        fitDymButtons(); 
+        fitDymButtons(); // ボタンサイズ調整を実行
     });
   });
-}
-
-// ヘルパー: お気に入りボタンHTML生成
-function createFavBtnHtml(videoId) {
-    const activeClass = isFavorite(videoId) ? ' active' : '';
-    const iconType = isFavorite(videoId) ? 'fa-solid' : 'fa-regular';
-    return `<button class="fav-btn${activeClass}" data-id="${videoId}" aria-label="お気に入り" title="お気に入り"><i class="${iconType} fa-star"></i></button>`;
 }
 
 function renderPagination(totalCount) {
@@ -1131,50 +1463,25 @@ function updateActiveFilters() {
   const area = document.getElementById("filtersBar");
   const searchBox = document.getElementById("searchBox");
   let html = '';
+  // 検索キーワードやフィルター値はURLパラメータ(?q= 等)経由でも入るため、必ずエスケープする
   if (searchBox.value.trim()) {
     html += `<button class="filter-tag" tabindex="0" aria-label="キーワード解除" data-type="keyword">
-               <i class="fa fa-search"></i> "${searchBox.value.trim()}" <i class="fa fa-xmark"></i>
+               <i class="fa fa-search"></i> <span class="tag-label">"${escapeHtml(searchBox.value.trim())}"</span> <i class="fa fa-xmark"></i>
              </button>`;
   }
-  
-  selectedCategories.forEach(c => {
-    const label = c === "RADIO" ? "ラジオ" : (c === "VIDEO" ? "動画" : c);
-    html += `<button class="filter-tag" tabindex="0" aria-label="カテゴリフィルタ解除 ${label}" data-type="category" data-value="${c}" style="background:#6654e8;color:#fff;">
-               <i class="fa fa-folder"></i> ${label} <i class="fa fa-xmark"></i>
-             </button>`;
-  });
-
-  if (selectedWorks) {
-    html += `<button class="filter-tag" tabindex="0" aria-label="作品フィルタ解除 ${selectedWorks}" data-type="works" data-value="${selectedWorks}">
-               <i class="fa fa-tv"></i> ${selectedWorks} <i class="fa fa-xmark"></i>
-             </button>`;
-  }
-
-  // ▼▼▼ 追加：人物名のタグ表示 ▼▼▼
-  if (selectedPerson) {
-    html += `<button class="filter-tag" tabindex="0" aria-label="人物フィルタ解除 ${selectedPerson}" data-type="person" data-value="${selectedPerson}">
-               <i class="fa fa-user"></i> ${selectedPerson} <i class="fa fa-xmark"></i>
-             </button>`;
-  }
-  // ▲▲▲ 追加 ▲▲▲
-
-  selectedGuests.forEach(g => { 
-    html += `<button class="filter-tag" tabindex="0" aria-label="ゲストフィルタ解除 ${g}" data-type="guest" data-value="${g}"><i class="fa fa-user"></i> ${g} <i class="fa fa-xmark"></i></button>`;
-  });
-
-  selectedCorners.forEach(c => html += `<button class="filter-tag" tabindex="0" aria-label="コーナーフィルタ解除 ${c}" data-type="corner" data-value="${c}"><i class="fa fa-cubes"></i> ${c} <i class="fa fa-xmark"></i></button>`);
-  selectedYears.forEach(y => html += `<button class="filter-tag" tabindex="0" aria-label="年フィルタ解除 ${y}" data-type="year" data-value="${y}"><i class="fa fa-calendar"></i> <span class="impact-number">${y}</span> <i class="fa fa-xmark"></i></button>`);
+  const tag = (type, value, icon, ariaName, labelClass = 'tag-label') => // アイコンはフィルター画面の見出しと同じ（さーち・ざ・らじお！と同じ）
+    `<button class="filter-tag" tabindex="0" aria-label="${ariaName}フィルタ解除 ${escapeHtml(value)}" data-type="${type}" data-value="${escapeHtml(value)}"><i class="fa ${icon}"></i> <span class="${labelClass}">${escapeHtml(value)}</span> <i class="fa fa-xmark"></i></button>`;
+  selectedCategories.forEach(c => html += tag('category', c, 'fa-solid fa-folder-open', 'カテゴリ'));
+  if (selectedWorks) html += tag('works', selectedWorks, 'fa-solid fa-tv', '出演作品');
+  if (selectedPerson) html += tag('person', selectedPerson, 'fa-user', '人物');
+  selectedCorners.forEach(c => html += tag('corner', c, 'fa-solid fa-radio', 'コーナー'));
+  selectedYears.forEach(y => html += tag('year', y, 'fa-solid fa-calendar-days', '年', 'impact-number tag-label'));
   area.innerHTML = html;
 }
 
 function updateFilterButtonStyles() {
-  document.querySelectorAll('.btn-category[data-category]').forEach(btn => {
+  document.querySelectorAll('.btn-corner[data-category]').forEach(btn => {
     const active = selectedCategories.includes(btn.dataset.category);
-    btn.classList.toggle('active', active);
-    btn.setAttribute('aria-pressed', String(active));
-  });
-  document.querySelectorAll('.guest-button[data-guest]').forEach(btn => { 
-    const active = selectedGuests.includes(btn.dataset.guest);
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-pressed', String(active));
   });
@@ -1188,86 +1495,436 @@ function updateFilterButtonStyles() {
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-pressed', String(active));
   });
+  syncFilterSelects();
 }
 
 function fitGuestLines() {
+  let needsRetry = false;
+  const MIN_FONT_SIZE = 8.5;
+
+  // ★性能改善: 以前は1行ごとに「スタイル変更→幅計測」を繰り返していたため、
+  // 20カード×3行の描画で100回超の強制リフローが発生し、ローディング中の
+  // アニメーション（跳ねる球）が低速端末でカクつく主因になっていた。
+  // 「全行リセット→全行計測→全行適用」の読み書き分離バッチに変更し、
+  // 強制リフローを全体で数回に抑える。
+
+  // ★このサイトではタイトル行（.guest-one-line）は圧縮せず、CSSで「…」省略にする
+  //   （文字の詰まり具合が回ごとにバラバラにならず、スマホでも統一感が出る）。
+  //   ここでは公開日時・再生時間の行だけを調整する
+  const guestLines = [];
+  const metaContainers = Array.from(document.querySelectorAll('.episode-meta'));
+  const metaGroups = metaContainers
+    .map(c => Array.from(c.querySelectorAll('.meta-one-line')))
+    .filter(lines => lines.length > 0);
+  const allLines = guestLines.concat(metaGroups.flat());
+  if (allLines.length === 0) return;
+
+  // ★ゲスト名は「文字サイズ縮小」ではなく、フィルタボタンと同じ「水平圧縮(scaleX)」で収める。
+  //   圧縮率がこの値を下回るほど長い場合だけ、保険として文字サイズ縮小も併用する
+  const MIN_GUEST_SCALE = 0.6;
+
+  // --- フェーズ1: 全行のスタイルを一括リセット（書き込みのみ） ---
+  for (const line of allLines) {
+    line.style.fontSize = '';
+    line.style.transform = '';
+    line.style.whiteSpace = 'nowrap';
+  }
+
+  // --- フェーズ2: 全行まとめて計測（読み取りのみ＝強制リフローは実質1回） ---
+  const measure = (line) => {
+    const parent = line.parentElement;
+    if (!parent) return null;
+    const compStyle = window.getComputedStyle(parent);
+    const parentWidth = parent.clientWidth
+      - (parseFloat(compStyle.paddingLeft) || 0)
+      - (parseFloat(compStyle.paddingRight) || 0);
+    if (parentWidth <= 10) {
+      // display:none で隠れている行（閉じたタイムスタンプモーダル内のエピソードカード等）は
+      // 幅が永遠に0のままなので再試行対象にしない。これを再試行し続けると
+      // 100ms間隔の無限リフローループになり、低速端末で常時カクつく原因になる。
+      if (line.offsetParent !== null) needsRetry = true;
+      return null;
+    }
+    const currentWidth = line.scrollWidth;
+    let finalSize = parseFloat(window.getComputedStyle(line).fontSize) || 12;
+    if (currentWidth > parentWidth) {
+      finalSize = Math.max((parentWidth / currentWidth) * finalSize, MIN_FONT_SIZE);
+    }
+    return { finalSize, parentWidth };
+  };
+  // ゲスト名用: 文字サイズは維持し、はみ出す分だけ水平圧縮率(scale)を求める
+  const measureGuest = (line) => {
+    const parent = line.parentElement;
+    if (!parent) return null;
+    const compStyle = window.getComputedStyle(parent);
+    const parentWidth = parent.clientWidth
+      - (parseFloat(compStyle.paddingLeft) || 0)
+      - (parseFloat(compStyle.paddingRight) || 0);
+    if (parentWidth <= 10) {
+      if (line.offsetParent !== null) needsRetry = true;
+      return null;
+    }
+    const currentWidth = line.scrollWidth;
+    const baseSize = parseFloat(window.getComputedStyle(line).fontSize) || 12;
+    let scale = 1, finalSize = baseSize;
+    if (currentWidth > parentWidth) {
+      const ratio = parentWidth / currentWidth;
+      if (ratio >= MIN_GUEST_SCALE) {
+        scale = ratio;
+      } else {
+        // 圧縮だけでは収まらない極端な長さ: 下限まで圧縮し、残りは文字サイズで吸収
+        scale = MIN_GUEST_SCALE;
+        finalSize = Math.max(baseSize * (ratio / MIN_GUEST_SCALE), MIN_FONT_SIZE);
+      }
+    }
+    return { finalSize, scale, parentWidth };
+  };
+  const guestResults = guestLines.map(measureGuest);
+  const metaResults = metaGroups.map(lines => lines.map(measure));
+
+  // --- フェーズ3: 計測結果を一括適用（書き込みのみ） ---
+  // 適用サイズが最小値の行は、適用後のはみ出し確認（フェーズ4）の対象として記録する
+  const ellipsisChecks = [];
+
+  guestLines.forEach((line, i) => {
+    const res = guestResults[i];
+    if (!res) {
+      line.style.whiteSpace = 'normal';
+      line.style.visibility = 'visible';
+      return;
+    }
+    if (res.finalSize !== undefined && Math.abs(res.finalSize - (parseFloat(line.style.fontSize) || 0)) > 0.01 && res.scale === MIN_GUEST_SCALE) {
+      line.style.fontSize = res.finalSize + 'px';
+    }
+    line.style.transform = res.scale < 1 ? `scaleX(${res.scale.toFixed(3)})` : '';
+    if (res.finalSize === MIN_FONT_SIZE) {
+      ellipsisChecks.push({ line, parentWidth: res.parentWidth, scale: res.scale });
+    } else {
+      line.classList.remove('needs-ellipsis');
+      line.style.visibility = 'visible';
+    }
+  });
+
+  metaGroups.forEach((lines, gi) => {
+    const results = metaResults[gi];
+    // 同じ親要素内の行は「一番小さいサイズ」に揃えて適用
+    let minSize = 999;
+    results.forEach(res => { if (res && res.finalSize < minSize) minSize = res.finalSize; });
+    lines.forEach((line, li) => {
+      const res = results[li];
+      if (!res || minSize === 999) {
+        if (!res) line.style.whiteSpace = 'normal';
+        line.style.visibility = 'visible';
+        return;
+      }
+      line.style.fontSize = minSize + 'px';
+      if (minSize === MIN_FONT_SIZE) {
+        ellipsisChecks.push({ line, parentWidth: res.parentWidth });
+      } else {
+        line.classList.remove('needs-ellipsis');
+        line.style.visibility = 'visible';
+      }
+    });
+  });
+
+  // --- フェーズ4: 最小サイズ適用行のみ、はみ出しを再計測して「…」を付与 ---
+  // （読み取り→書き込みの順にまとめ、リフローを1回に抑える）
+  if (ellipsisChecks.length > 0) {
+    const widths = ellipsisChecks.map(({ line }) => line.scrollWidth); // 読み取りのみ
+    ellipsisChecks.forEach(({ line, parentWidth, scale = 1 }, i) => {
+      // ★微調整: 小数点以下の計算誤差を吸収するために +1 を追加（水平圧縮ぶんは見た目幅に換算）
+      line.classList.toggle('needs-ellipsis', widths[i] * scale > parentWidth + 1);
+      line.style.visibility = 'visible';
+    });
+  }
+
+  // 保険: 万一の再試行も上限を設け、無限ループを構造的に不可能にする
+  // （上限到達で諦めた場合もカウンタを戻す。戻さないと以後の呼び出しで再試行が永久に無効になる）
+  if (needsRetry && (fitGuestLines._retries = (fitGuestLines._retries || 0) + 1) <= 30) {
+    setTimeout(fitGuestLines, 100);
+  } else {
+    fitGuestLines._retries = 0;
+  }
 }
 
+// 「！」「（）」など全角約物はグリフ内に余白を持つため、レイアウト上は中央でも
+// 文字の実体（インク）が左右にずれて見える。Canvasで実描画範囲を計測し、
+// ずれを打ち消す補正量(px)を返す。（正の値 = 右へ動かすべき）
+let labelMeasureCtx = null;
+let labelMeasureCanvas = null;
+const inkBoundsCache = new Map();
+const HANGING_TRAIL = /[！？。]$/;
+
+// テキストを実際にオフスクリーンcanvasへ描き、ピクセルからインク（実描画）の左右端を測る。
+// canvas.measureText().actualBoundingBox* は WebKit(iOS Safari) が末尾約物や字形の
+// アキを正しく返さないため、実ピクセル走査に切り替えて全エンジンで同じ結果を得る。
+// ラベルは固定なので (font+text) 単位でキャッシュし、初回のみ計測する。
+function getInkBounds(text, font, fontSizePx) {
+  const key = font + '|' + text;
+  if (inkBoundsCache.has(key)) return inkBoundsCache.get(key);
+  let result = null;
+  try {
+    if (!labelMeasureCtx) {
+      labelMeasureCanvas = document.createElement('canvas');
+      labelMeasureCtx = labelMeasureCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    const ctx = labelMeasureCtx;
+    ctx.font = font;
+    const advance = ctx.measureText(text).width;
+    const pad = Math.ceil(fontSizePx * 0.7) + 4; // 左右のはみ出し（イタリック等）を拾う余白
+    const W = Math.ceil(advance) + pad * 2;
+    const H = Math.ceil(fontSizePx * 1.8) + 4;
+    labelMeasureCanvas.width = W;
+    labelMeasureCanvas.height = H;
+    ctx.font = font;
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#000';
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillText(text, pad, H / 2);
+    const data = ctx.getImageData(0, 0, W, H).data;
+    let minX = W, maxX = -1;
+    for (let x = 0; x < W; x++) {
+      for (let y = 0; y < H; y++) {
+        if (data[(y * W + x) * 4 + 3] > 24) { // alpha>24 を「インクあり」とみなす
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          break;
+        }
+      }
+    }
+    if (maxX >= 0) {
+      // テキスト原点(x=pad)基準のインク左右端と送り幅
+      result = { inkLeft: minX - pad, inkRight: maxX - pad + 1, advance };
+    }
+  } catch (_) { result = null; }
+  inkBoundsCache.set(key, result);
+  return result;
+}
+
+// 画面に実際に並んだ文字の位置から、インクの中心をずらす量を求める（正の値 = 右へ動かすべき）。
+// iOS Safari では画面の文字の並びが canvas で測った幅より広くなる（例: 「ピックアップキャラクター」で約5px）ため、
+// ラベル全体を canvas で測ると補正がずれて、文字が左に寄って見えていた。
+// そこで、先頭と末尾の文字の位置は画面（DOM）から取り、canvas はその1文字の字面の左右端だけに使う。
+// 変形を外した状態で呼ぶこと（fitFilterButtons のフェーズ2）。測れないときは null
+function getDomOpticalXOffset(span, font, fontSizePx) {
+  try {
+    const node = span.firstChild;
+    if (!node || node.nodeType !== 3) return null;
+    const text = node.textContent;
+    const chars = Array.from(text);
+    let first = 0, last = chars.length - 1;
+    while (first <= last && /\s/.test(chars[first])) first++;
+    while (last >= first && /\s/.test(chars[last])) last--;
+    if (first > last) return null;
+    const offsetOf = (idx) => chars.slice(0, idx).join('').length; // UTF-16 の位置（サロゲートペア対応）
+    const range = document.createRange();
+    const charLeft = (idx) => {
+      const s = offsetOf(idx);
+      range.setStart(node, s);
+      range.setEnd(node, s + chars[idx].length);
+      const rects = range.getClientRects();
+      return rects.length ? rects[0].left : null;
+    };
+    const firstLeft = charLeft(first), lastLeft = charLeft(last);
+    const a = getInkBounds(chars[first], font, fontSizePx);
+    const b = getInkBounds(chars[last], font, fontSizePx);
+    if (firstLeft == null || lastLeft == null || !a || !b) return null;
+    const box = span.getBoundingClientRect();
+    if (!box.width) return null;
+    const inkCenter = ((firstLeft + a.inkLeft) + (lastLeft + b.inkRight)) / 2;
+    let offset = (box.left + box.right) / 2 - inkCenter;
+    if (HANGING_TRAIL.test(text) && fontSizePx) offset += fontSizePx * 0.06;
+    return Math.max(-8, Math.min(8, offset)); // 異常値ガード
+  } catch (_) { return null; }
+}
+
+function getOpticalXOffset(text, font, fontSizePx) {
+  const b = getInkBounds(text, font, fontSizePx);
+  if (!b || !b.advance) return 0;
+  const inkCenter = (b.inkLeft + b.inkRight) / 2;
+  const boxCenter = b.advance / 2;
+  let offset = boxCenter - inkCenter; // インクが左寄りなら正（右へ寄せる）
+  // 末尾が全角約物（！？。）は字面が細く、インク中央に合わせても視覚的に右が空いて見える。
+  // font-size 基準で少しだけ余分にぶら下げて見た目の重心を合わせる。
+  if (HANGING_TRAIL.test(text) && fontSizePx) offset += fontSizePx * 0.06;
+  return Math.max(-8, Math.min(8, offset)); // 異常値ガード
+}
+
+// フィルタボタンの長いラベルを、文字サイズは変えずに水平圧縮(scaleX)で収める。
+// あわせて全ラベルをインク基準で光学センタリングする。
+// レイアウトスラッシング（読み↔書きの交互）を避けるため、
+// 「変形リセット→計測→変形適用」を3フェーズに分けてまとめて処理する。
+function fitFilterButtons() {
+  const BREATHING = 28; // 圧縮後も左右に14pxずつの余白が残るようにする
+  const jobs = [];
+
+  // フェーズ1: spanを用意し、全ボタンの変形を一括リセット（書き込みのみ）
+  document.querySelectorAll('.guest-button, .btn-corner, .btn-year').forEach(btn => {
+    let span = btn.querySelector('.btn-label-fit');
+    if (!span) {
+      if (btn.childElementCount > 0) return; // テキスト以外を含む想定外の構造はスキップ
+      span = document.createElement('span');
+      span.className = 'btn-label-fit';
+      span.textContent = btn.textContent;
+      btn.textContent = '';
+      btn.appendChild(span);
+    }
+    span.style.transform = '';
+    jobs.push({ btn, span });
+  });
+
+  // フェーズ2: 全ボタンをまとめて計測（読み取りのみ＝強制レイアウトは実質1回）
+  for (const job of jobs) {
+    const styles = window.getComputedStyle(job.btn);
+    const spanStyles = window.getComputedStyle(job.span);
+    job.avail = job.btn.clientWidth
+      - (parseFloat(styles.paddingLeft) || 0)
+      - (parseFloat(styles.paddingRight) || 0)
+      - BREATHING;
+    job.need = job.span.scrollWidth;
+    job.font = `${spanStyles.fontWeight} ${spanStyles.fontSize} ${spanStyles.fontFamily}`;
+    job.fontSizePx = parseFloat(spanStyles.fontSize) || 0;
+    job.domOptX = getDomOpticalXOffset(job.span, job.font, job.fontSizePx);
+  }
+
+  // フェーズ3: 変形を一括適用（書き込みのみ。canvas計測はレイアウト非依存）
+  for (const job of jobs) {
+    if (job.avail <= 10) continue; // 非表示中（ドロワーが閉じている等）は何もしない
+    const scale = job.need > job.avail ? job.avail / job.need : 1;
+    const parts = [];
+    // 光学補正量は圧縮前サイズで測っているため、scaleX圧縮ぶん(scale)を掛けて
+    // 実際の描画サイズに合わせる（transformは translateX→scaleX の順で適用されるため、
+    // インク中心を画面中央へ戻すのに必要な移動量は optX×scale になる）
+    const baseOpt = job.domOptX != null ? job.domOptX : getOpticalXOffset(job.span.textContent, job.font, job.fontSizePx);
+    const optX = baseOpt * scale;
+    if (Math.abs(optX) >= 0.2) parts.push(`translateX(${optX.toFixed(2)}px)`);
+    if (scale < 1) parts.push(`scaleX(${scale.toFixed(3)})`);
+    if (parts.length) job.span.style.transform = parts.join(' ');
+  }
+}
+
+// ★修正: もしかしてボタンのサイズ調整関数 (透明化解除付き)
 function fitDymButtons() {
   const buttons = document.querySelectorAll('.dym-word-btn');
+  
   buttons.forEach(btn => {
+    // もし「もっと見る」ボタンなど、すでに表示済みのものや特殊なボタンならスキップ
     if (btn.id === 'dymShowMoreBtn') return;
+
+    // 1. スタイルをリセットして計測準備（改行モードで付与した分も含めて全て戻す）
     btn.style.fontSize = '';
     btn.style.whiteSpace = 'nowrap';
     btn.style.lineHeight = '';
     btn.style.wordBreak = '';
-    btn.style.borderRadius = '99px'; 
+    btn.style.overflowWrap = '';
+    btn.style.padding = '';
+    btn.style.textAlign = '';
+    btn.style.borderRadius = '99px';
+
+    // 2. 計測: 中身(scrollWidth)が枠(clientWidth)より大きいか？
     if (btn.scrollWidth > btn.clientWidth) {
+      
       const currentSize = parseFloat(window.getComputedStyle(btn).fontSize);
+      // 比率計算
       let newSize = currentSize * (btn.clientWidth / btn.scrollWidth) * 0.95;
       const MIN_SIZE = 11; 
+
       if (newSize >= MIN_SIZE) {
+        // A. フォント縮小だけで収まる場合
         btn.style.fontSize = `${newSize}px`;
       } else {
+        // B. 縮小しても無理な場合 -> 改行モード
         btn.style.fontSize = '12px'; 
         btn.style.whiteSpace = 'normal'; 
         btn.style.lineHeight = '1.3';    
         btn.style.wordBreak = 'break-word'; 
         btn.style.overflowWrap = 'anywhere'; 
+        
         btn.style.borderRadius = '12px'; 
         btn.style.padding = '6px 12px';
         btn.style.textAlign = 'center';
       }
     }
+
+    // ★追加: 調整が終わったら不透明にして表示する
     btn.style.opacity = '1';
   });
 }
 
+// ... (後略: URL状態管理、イベントリスナーなどは変更なし) ...
+
+/**
+ * ===================================================
+ * ★★★ URL状態管理 ★★★
+ * ===================================================
+ */
 function buildURLFromState({ method = 'push' } = {}) {
   if (isRestoringURL) return;
   const params = new URLSearchParams();
   const q = document.getElementById('searchBox').value.trim();
   if (q) params.set('q', q);
-  selectedCategories.forEach(v => params.append('cat', v)); 
-  selectedGuests.forEach(v => params.append('g', v)); 
+  selectedCategories.forEach(v => params.append('cat', v));
+  if (selectedWorks) params.set('works', selectedWorks);
+  if (selectedPerson) params.set('person', selectedPerson);
   selectedCorners.forEach(v => params.append('c', v));
   selectedYears.forEach(y => params.append('y', String(y)));
-
-  if (selectedWorks) params.set('works', selectedWorks);
-  if (selectedPerson) params.set('person', selectedPerson); // ★追加
-
   const sort = document.getElementById('sortSelect').value;
   if (sort !== 'newest') params.set('sort', sort);
   if (showFavoritesOnly) params.set('fav', '1');
   if (currentPage > 1) params.set('p', String(currentPage));
   const qs = params.toString();
   const url = qs ? `?${qs}` : location.pathname;
-  const state = { q, selectedCategories, selectedGuests, selectedCorners, selectedYears, sort, fav: showFavoritesOnly, p: currentPage };
+  const state = { q, selectedCategories, selectedWorks, selectedPerson, selectedCorners, selectedYears, sort, fav: showFavoritesOnly, p: currentPage };
+  // いまと同じURLなら積まずに書き換える（初回表示や、同じ条件での検索のやり直しで履歴が重複しないように）
+  const same = (qs ? `?${qs}` : '') === location.search;
   try {
-    history[method === 'replace' ? 'replaceState' : 'pushState'](state, '', url);
+    history[(method === 'replace' || same) ? 'replaceState' : 'pushState'](state, '', url);
   } catch {}
+}
+
+// 「戻る/進む」でパラメータ無しのURLに戻った時に、画面も初期状態へ同期させる。
+// （以前はapplyStateFromURLが何もせずfalseを返すだけで、直前の検索結果が残ったままだった）
+function applyDefaultStateForPopstate() {
+  isRestoringURL = true;
+  const searchBox = document.getElementById('searchBox');
+  if (searchBox) {
+    searchBox.value = '';
+    syncClearButton(); // クリアボタン表示も同期（input を送ると検索候補が開くので直接）
+  }
+  const sortSelect = document.getElementById('sortSelect');
+  if (sortSelect) sortSelect.value = 'newest';
+  selectedCategories = [];
+  selectedWorks = "";
+  selectedPerson = "";
+  selectedCorners = [];
+  selectedYears = [];
+  showFavoritesOnly = false;
+  const favBtn = document.getElementById('favOnlyToggleBtn');
+  if (favBtn) {
+    favBtn.classList.remove('active');
+    favBtn.setAttribute('aria-pressed', 'false');
+  }
+  document.body.classList.remove('fav-only');
+  updateFilterButtonStyles();
+  search({ gotoPage: 1 });
+  isRestoringURL = false;
 }
 
 function applyStateFromURL({ replace = false } = {}) {
   const params = new URLSearchParams(location.search);
   if (![...params.keys()].length) return false;
   isRestoringURL = true;
-  const readMulti = (key) => params.getAll(key).flatMap(v => v.includes(',') ? v.split(',') : v).map(decodeURIComponent).filter(Boolean);
+
+  // URLSearchParamsが既にデコード済みの値を返すため、decodeURIComponentの二重適用はしない
+  // （「100%」のような%を含む値でURIErrorになり復元全体が壊れるバグの修正）
+  const readMulti = (key) => params.getAll(key).flatMap(v => v.includes(',') ? v.split(',') : v).map(v => v.trim()).filter(Boolean);
   document.getElementById('searchBox').value = params.get('q') || '';
-  selectedCategories = readMulti('cat'); 
-  selectedGuests = readMulti('g'); 
+  syncClearButton();
+  selectedCategories = readMulti('cat');
+  selectedWorks = (params.get('works') || '').trim();
+  selectedPerson = (params.get('person') || '').trim();
   selectedCorners = readMulti('c');
   selectedYears = readMulti('y').map(String);
-  selectedWorks = params.get('works') || "";
-  const worksSelect = document.getElementById('worksSelect');
-  if (worksSelect) worksSelect.value = selectedWorks;
-
-  // ▼▼▼ 追加：人物名のURLからの復元 ▼▼▼
-  selectedPerson = params.get('person') || "";
-  const personSelect = document.getElementById('personSelect');
-  if (personSelect) personSelect.value = selectedPerson;
-  // ▲▲▲ 追加 ▲▲▲
-
   document.getElementById('sortSelect').value = params.get('sort') || 'newest';
   showFavoritesOnly = params.get('fav') === '1';
   const favBtn = document.getElementById('favOnlyToggleBtn');
@@ -1275,11 +1932,19 @@ function applyStateFromURL({ replace = false } = {}) {
   favBtn.setAttribute('aria-pressed', showFavoritesOnly);
   document.body.classList.toggle('fav-only', showFavoritesOnly);
   updateFilterButtonStyles();
-  currentPage = parseInt(params.get('p') || '1', 10) || 1;
+  currentPage = Math.max(1, parseInt(params.get('p') || '1', 10) || 1);
+
   search({ gotoPage: currentPage });
   isRestoringURL = false;
   if (replace) buildURLFromState({ method: 'replace' });
   return true;
+}
+
+// 検索欄の×ボタンは、欄に文字があるときだけ出す（input イベントを送ると検索候補まで開いてしまうので、直接合わせる）
+function syncClearButton() {
+  const b = document.getElementById('clearSearchBtn');
+  const box = document.getElementById('searchBox');
+  if (b && box) b.hidden = !box.value;
 }
 
 function scrollToResultsTop() {
@@ -1300,23 +1965,56 @@ function setupEventListeners() {
   const drawer = document.getElementById('filterDrawer');
   const backdrop = document.getElementById('drawerBackdrop');
 
+  let drawerCloseTimer = 0;
   const toggleFilterDrawer = (forceOpen) => {
     const style = window.getComputedStyle(drawer);
-    const isVisible = style.display !== 'none';
+    // フェードアウト中(.closing)は「閉じている」扱いにする（連打時の判定ずれ防止）
+    const isVisible = style.display !== 'none' && !drawer.classList.contains('closing');
     const isOpening = forceOpen === true || (forceOpen !== false && !isVisible);
+
     if (isOpening) {
-        drawer.style.display = 'block';
-        fitFilterButtonsSync();
-    } else {
+      // フェードアウト途中で開き直された場合は closing を解除して即表示
+      clearTimeout(drawerCloseTimer);
+      drawer.classList.remove('closing');
+      drawer.style.display = 'block';
+    } else if (style.display !== 'none' && !drawer.classList.contains('closing')) {
+      // 閉じる: 即 display:none にせず、フェードアウト(.closing)完了後に非表示へ
+      drawer.classList.add('closing');
+      drawerCloseTimer = setTimeout(() => {
+        drawer.classList.remove('closing');
         drawer.style.display = 'none';
+      }, 180); // CSSの fade-only-out 0.17s より少しだけ長く
     }
     backdrop.classList.toggle('show', isOpening);
     filterToggleBtn.setAttribute('aria-expanded', String(isOpening));
     filterToggleBtn.setAttribute('aria-pressed', String(isOpening));
+
     if (isOpening) window.acquireBodyLock();
     else window.releaseBodyLock();
+
+    // ドロワーが開いて幅が確定してから、長いラベルの水平圧縮を計算する。
+    // 低速端末でレイアウトやWebフォントの確定が2フレームに間に合わない場合に備え、
+    // 少し遅らせた保険パスも走らせる（fitFilterButtonsは何度呼んでも同じ結果になる）。
+    if (isOpening) {
+      requestAnimationFrame(() => requestAnimationFrame(fitFilterButtons));
+      setTimeout(fitFilterButtons, 350);
+    }
   };
   window.toggleFilterDrawer = toggleFilterDrawer;
+
+  // ★折りたたみスマホを広げた時（iPhone Duo 等）はフィルターが左のサイドバーとして常に表示される。
+  // 畳んだ状態でフィルター画面を開いたまま広げると、背景の暗幕とスクロール固定が残ってしまうため、
+  // 展開レイアウトに切り替わった瞬間に「開いている」状態を解除する（見た目はサイドバーとして残る）。
+  const duoMq = window.matchMedia && window.matchMedia('(orientation: landscape) and (pointer: coarse) and (min-width: 780px) and (max-width: 1069px) and (min-height: 501px)');
+  if (duoMq) {
+    const onDuoChange = () => {
+      if (duoMq.matches && drawer.style.display === 'block') toggleFilterDrawer(false);
+      // サイドバー化で幅が変わるので、長いラベルの圧縮を計算し直す
+      requestAnimationFrame(() => requestAnimationFrame(fitFilterButtons));
+    };
+    if (duoMq.addEventListener) duoMq.addEventListener('change', onDuoChange);
+    else if (duoMq.addListener) duoMq.addListener(onDuoChange);
+  }
 
   filterToggleBtn.addEventListener('click', () => toggleFilterDrawer());
   document.getElementById('drawerCloseBtn').addEventListener('click', () => toggleFilterDrawer(false));
@@ -1335,6 +2033,7 @@ function setupEventListeners() {
     const pool = (lastResults.length > 0) ? lastResults : data;
     if (pool.length === 0) return;
     const pick = pool[Math.floor(Math.random() * pool.length)];
+
     if (pick && pick.link) {
       const a = document.createElement('a');
       a.href = pick.link;
@@ -1348,41 +2047,41 @@ function setupEventListeners() {
   });
 
   document.getElementById('mainResetBtn').addEventListener('click', resetSearch);
-  document.getElementById('sortSelect').addEventListener('change', () => search());
+  // sortSelectのchangeリスナーは後方（scrollToResultsTop付き）の1箇所に集約
+  // （以前はここでも登録していて1回の変更で検索が2回実行されていた）
 
   const handleFilterClick = (e, collection, type) => {
       const btn = e.target.closest(`[data-${type}]`);
       if (!btn) return;
       const value = btn.dataset[type];
       const index = collection.indexOf(value);
-      index > -1 ? collection.splice(index, 1) : collection.push(value);
-      updateFilterButtonStyles();
+      const active = index === -1; // 押す前に無ければ今回ONにする
+      active ? collection.push(value) : collection.splice(index, 1);
+      // 変わったのは押したボタン1つだけなので、全ボタン走査せずここだけ更新する
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
       search();
       scrollToResultsTop();
   };
 
-  // ▼▼▼ 修正版: どの枠(カテゴリ/その他)にあっても反応するように、親要素(drawer)で監視 ▼▼▼
-  if (drawer) {
-    drawer.addEventListener('click', e => {
-      // data-category 属性を持つボタンがクリックされたら反応させる
-      if (e.target.closest('[data-category]')) {
-        handleFilterClick(e, selectedCategories, 'category');
-      }
-    });
-  }
-
-
-  // ゲストボタン（HTML上にIDがない場合があるのでチェック）
-  const guestBtnGroup = document.getElementById('guestButtonGroup');
-  if (guestBtnGroup) {
-      guestBtnGroup.addEventListener('click', e => handleFilterClick(e, selectedGuests, 'guest'));
-  }
-  
+  document.getElementById('categoryButtonGroup').addEventListener('click', e => handleFilterClick(e, selectedCategories, 'category'));
   document.getElementById('cornerButtonGroup').addEventListener('click', e => handleFilterClick(e, selectedCorners, 'corner'));
-  
-  
-  
   document.getElementById('yearButtonGroup').addEventListener('click', e => handleFilterClick(e, selectedYears, 'year'));
+
+  // 出演作品・人物名はプルダウン（単一選択）。「未選択」に戻すと解除
+  const bindFilterSelect = (id, apply) => {
+    const select = document.getElementById(id);
+    if (!select) return;
+    select.addEventListener('change', () => {
+      apply(select.value);
+      select.classList.toggle('active', !!select.value);
+      search();
+      scrollToResultsTop();
+      select.blur();
+    });
+  };
+  bindFilterSelect('worksSelect', v => { selectedWorks = v; });
+  bindFilterSelect('personSelect', v => { selectedPerson = v; });
 
   document.getElementById('paginationArea').addEventListener('click', e => {
     const btn = e.target.closest('.page-btn');
@@ -1401,50 +2100,82 @@ function setupEventListeners() {
     const tag = e.target.closest('.filter-tag');
     if (!tag) return;
     const { type, value } = tag.dataset;
-    if (type === 'keyword') document.getElementById('searchBox').value = '';
-    else if (type === 'category') selectedCategories = selectedCategories.filter(c => c !== value); 
-    else if (type === 'guest') selectedGuests = selectedGuests.filter(g => g !== value); 
+    const searchBoxEl = document.getElementById('searchBox');
+    if (type === 'keyword' && searchBoxEl) searchBoxEl.value = '';
+    else if (type === 'category') selectedCategories = selectedCategories.filter(c => c !== value);
+    else if (type === 'works') selectedWorks = "";
+    else if (type === 'person') selectedPerson = "";
     else if (type === 'corner') selectedCorners = selectedCorners.filter(c => c !== value);
     else if (type === 'year') selectedYears = selectedYears.filter(y => y !== String(value));
-    else if (type === 'works') {
-        selectedWorks = ""; // 変数をクリア
-        document.getElementById('worksSelect').value = ""; // プルダウンを「作品を選択」に戻す
-    }
-    // ▼▼▼ 追加：人物名タグの解除イベント ▼▼▼
-    else if (type === 'person') {
-        selectedPerson = "";
-        document.getElementById('personSelect').value = "";
-    }
-    // ▲▲▲ 追加 ▲▲▲
-    searchBox.dispatchEvent(new Event('input'));
+    if (type === 'keyword') syncClearButton();
     updateFilterButtonStyles();
     search();
     scrollToResultsTop();
   });
 
   document.getElementById('results').addEventListener('click', e => {
+
+    // 「もしかして」候補ボタン（インラインonclickの代替。data-word経由で安全に検索実行）
+    const dymBtn = e.target.closest('.dym-word-btn');
+    if (dymBtn) {
+      if (dymBtn.id === 'dymShowMoreBtn') {
+        const hiddenArea = document.getElementById('dymHiddenArea');
+        if (hiddenArea) hiddenArea.style.display = 'inline';
+        dymBtn.style.display = 'none';
+        fitDymButtons();
+      } else if (dymBtn.dataset.word) {
+        window.applyDidYouMean(dymBtn.dataset.word);
+      }
+      return;
+    }
+
     const homeBtn = e.target.closest('#favGoHomeBtn');
-    if (homeBtn) exitFavoritesMode(); 
+  if (homeBtn) {
+    // ★変更: resetSearch() ではなく exitFavoritesMode() を呼ぶ
+    exitFavoritesMode();
+  }
+
+    // お気に入り一括削除（サイト内確認パネル経由）
+    if (e.target.closest('#favClearAllBtn')) {
+      document.getElementById('favClearAllBtn').hidden = true;
+      document.getElementById('favClearConfirm').hidden = false;
+      return;
+    }
+    if (e.target.closest('#favClearCancelBtn')) {
+      document.getElementById('favClearConfirm').hidden = true;
+      document.getElementById('favClearAllBtn').hidden = false;
+      return;
+    }
+    if (e.target.closest('#favClearOkBtn')) {
+      clearAllTimestamps();
+      search({ gotoPage: 1 }); // 再描画（お気に入り一覧は空になり、★やバッジも同期される）
+      return;
+    }
+
     const target = e.target;
     
-    // カメラボタンのクリックは openPhotoLinksModal で制御するためここでは何もしない
-    // (通常のお気に入りボタン処理)
+    // フォトメモリンク（カメラ）ボタンの処理
+    const photoBtn = target.closest('.photo-btn');
+    if (photoBtn) {
+      e.preventDefault(); e.stopPropagation();
+      const ep = photoBtn.dataset.ep;
+      if (window.openPhotoModal) window.openPhotoModal(ep);
+      return;
+    }
+
     const favBtn = target.closest('.fav-btn');
     if (favBtn) {
       e.preventDefault(); e.stopPropagation();
-      const id = favBtn.dataset.id;
-      toggleFavorite(id);
-      favBtn.classList.toggle('active');
-      favBtn.querySelector('i').classList.toggle('fa-regular');
-      favBtn.querySelector('i').classList.toggle('fa-solid');
-      favBtn.closest('.episode-item').classList.toggle('is-fav', isFavorite(id));
-      if (showFavoritesOnly) search({ gotoPage: currentPage });
+      // ★変更: 即時トグルではなく、タイムスタンプ登録モーダルを開く
+      if (window.openTsModal) {
+        window.openTsModal(favBtn.dataset.id, favBtn.dataset.title, favBtn.dataset.link, favBtn.closest('.episode-item'), favBtn.dataset.duration);
+      }
       return;
     }
     const tsBtn = target.closest('.ts-btn');
     if (tsBtn) {
       e.preventDefault(); e.stopPropagation();
-      window.open(withTimeParam(tsBtn.dataset.url, Number(tsBtn.dataset.ts)), '_blank', 'noopener');
+      window.open(tsBtn.dataset.url, '_blank', 'noopener');
       return;
     }
   });
@@ -1459,10 +2190,50 @@ function setupEventListeners() {
     }
   });
 
-  window.addEventListener('popstate', () => applyStateFromURL({ replace: false }));
+  // スタジオオンショット（X投稿へのリンク一覧）
+  const onshotToggle = document.getElementById('onshotToggle');
+  if (onshotToggle) {
+    onshotToggle.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (window.openOnshotModal) window.openOnshotModal();
+    });
+  }
+
+  window.addEventListener('popstate', () => {
+    if (!applyStateFromURL({ replace: false })) applyDefaultStateForPopstate();
+  });
   window.addEventListener('orientationchange', () => setTimeout(fitGuestLines, 120), { passive: true });
 
-  ['filterToggleBtn', 'favOnlyToggleBtn', 'randomBtn', 'mainResetBtn', 'historyToggle'].forEach(id => {
+  // ★修正: Webフォント確定後に文字幅を再計測する。
+  // 初回描画がフォント読込より先に走ると、幅の広い代替フォントで計測した縮小サイズが
+  // 残ってゲスト名が小さくなったままになる。Typekit(webfontloader)のフォントは
+  // document.fonts のイベントを発火しないことがあるため、webfontloaderが<html>に
+  // 付与する wf-active / wf-inactive クラスを監視して確実に再計測する。
+  {
+    // フォント確定で描画が変わるため、代替フォントで測ったインク境界キャッシュは破棄して測り直す
+    const refitAfterFonts = () => { inkBoundsCache.clear(); fitGuestLines(); fitDymButtons(); fitFilterButtons(); };
+    const htmlEl = document.documentElement;
+    const fontsSettled = () => htmlEl.classList.contains('wf-active') || htmlEl.classList.contains('wf-inactive');
+    if (fontsSettled()) {
+      refitAfterFonts();
+    } else {
+      const fontObserver = new MutationObserver(() => {
+        if (fontsSettled()) {
+          fontObserver.disconnect();
+          refitAfterFonts();
+          setTimeout(refitAfterFonts, 800); // 動的サブセットの遅れ分をもう一度
+        }
+      });
+      fontObserver.observe(htmlEl, { attributes: true, attributeFilter: ['class'] });
+    }
+    // 補助: document.fonts のイベントが発火する環境ではそちらでも再計測
+    if (document.fonts) {
+      document.fonts.ready.then(refitAfterFonts);
+      document.fonts.addEventListener('loadingdone', refitAfterFonts);
+    }
+  }
+
+  ['filterToggleBtn', 'favOnlyToggleBtn', 'randomBtn', 'mainResetBtn', 'latestBtn', 'historyToggle', 'onshotToggle'].forEach(id => {
     const el = document.getElementById(id);
     if (el) {
       el.addEventListener('pointerup', (e) => {
@@ -1478,8 +2249,8 @@ function setupEventListeners() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
         fitGuestLines();
-        fitDymButtons(); 
-        fitFilterButtonsSync();
+        fitDymButtons(); // ★リサイズ時も調整を実行
+        fitFilterButtons();
     }, 150);
   }, { passive: true });
 
@@ -1495,13 +2266,16 @@ function setupEventListeners() {
     const toggleClearBtn = () => {
       clearSearchBtn.hidden = !searchBoxForClear.value;
     };
+
     searchBoxForClear.addEventListener('input', toggleClearBtn);
+
     clearSearchBtn.addEventListener('click', () => {
       searchBoxForClear.value = '';
       toggleClearBtn();
       search();
       searchBoxForClear.focus();
     });
+
     toggleClearBtn();
   }
 
@@ -1513,31 +2287,9 @@ function setupEventListeners() {
       mainSearchBtn.blur();
     });
   }
-
-  const worksSelect = document.getElementById('worksSelect');
-  if (worksSelect) {
-    worksSelect.addEventListener('change', (e) => {
-      selectedWorks = e.target.value; 
-      search({ gotoPage: 1 });
-      scrollToResultsTop();
-      worksSelect.blur();
-    });
-  }
-
-  // ▼▼▼ 追加：人物名プルダウン変更時のイベント ▼▼▼
-  const personSelect = document.getElementById('personSelect');
-  if (personSelect) {
-    personSelect.addEventListener('change', (e) => {
-      selectedPerson = e.target.value; 
-      search({ gotoPage: 1 });
-      scrollToResultsTop();
-      personSelect.blur();
-    });
-  }
-  // ▲▲▲ 追加 ▲▲▲
 }
 
-// ... (後略: スクロールロックなど変更なし) ...
+// ... (後略: その他のUI機能、テーマ設定、スクロールロック等は変更なし) ...
 
 (function scrollLockModule() {
   let lockCount = 0;
@@ -1547,6 +2299,7 @@ function setupEventListeners() {
   window.acquireBodyLock = () => {
     if (lockCount === 0) {
       const scrollbarWidth = window.innerWidth - htmlElement.clientWidth;
+      
       if (scrollbarWidth > 0 && stickyHeader) {
         stickyHeader.style.paddingRight = `${scrollbarWidth}px`;
       }
@@ -1554,91 +2307,100 @@ function setupEventListeners() {
     }
     lockCount++;
   };
+
   window.releaseBodyLock = () => {
     lockCount = Math.max(0, lockCount - 1);
     if (lockCount === 0) {
-      if (stickyHeader) stickyHeader.style.paddingRight = '';
+      if (stickyHeader) {
+        stickyHeader.style.paddingRight = '';
+      }
       htmlElement.classList.remove('scroll-locked');
     }
   };
-  window.__hardUnlockScroll = () => { lockCount = 0; window.releaseBodyLock(); };
+  
+  window.__hardUnlockScroll = () => {
+    lockCount = 0;
+    window.releaseBodyLock();
+  };
 })();
 
-/**
- * ★カラーテーマ設定（白・黒・赤のみに制限）
- */
 function setupThemeSwitcher() {
   const toggleBtn = document.getElementById('theme-toggle-btn');
   const panel = document.getElementById('floating-theme-panel');
   if (!toggleBtn || !panel) return;
 
   const THEME_KEY = 'site_theme_v1';
-  // ★制限されたテーマのみ許可
+  // このサイトのテーマは ホワイト / ブラック / レッド の3種類のみ（index.html冒頭のスクリプトと同期）
   const allowedThemes = ['light', 'dark', 'red'];
-  const allThemeClasses = ['dark-mode', 'theme-red']; // 他のクラスは不要なので削除
-
-  // HTML上にある不要なボタン（ピンク、イエローなど）を自動削除
-  panel.querySelectorAll('.theme-btn').forEach(btn => {
-    const t = btn.dataset.theme;
-    if (!allowedThemes.includes(t)) {
-      btn.remove();
-    }
-  });
+  const allThemeClasses = ['dark-mode', 'theme-red'];
 
   const observer = new MutationObserver(() => {
     const isActive = panel.classList.contains('show');
     toggleBtn.classList.toggle('is-active', isActive);
   });
   observer.observe(panel, { attributes: true, attributeFilter: ['class'] });
+  
   toggleBtn.classList.toggle('is-active', panel.classList.contains('show'));
 
-  const applyTheme = (themeName) => {
-    // 許可されていないテーマなら強制的にlightにする
+  const applyTheme = (themeName, opts = {}) => {
     if (!allowedThemes.includes(themeName)) themeName = 'light';
+    // ★切替時の混色防止: 各要素の色トランジションが個別に走ると、切替の一瞬
+    // 「旧テーマと新テーマが混ざった配色」に見える。切替中だけ全トランジションを
+    // 止めて、全要素を同一フレームで一斉に切り替える。
+    const root = document.documentElement;
+    root.classList.add('theme-switching');
+    requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('theme-switching')));
 
-    // bodyとhtmlの両方からクラスを削除
     document.body.classList.remove(...allThemeClasses);
-    document.documentElement.classList.remove(...allThemeClasses);
-
-    // 選択されたテーマのクラスをbodyとhtmlの両方に付与
-    if (themeName === 'dark') {
-      document.body.classList.add('dark-mode');
-      document.documentElement.classList.add('dark-mode');
-    } else if (themeName === 'red') {
-      document.body.classList.add('theme-red');
-      document.documentElement.classList.add('theme-red');
-    }
-    
+    if (themeName === 'dark') document.body.classList.add('dark-mode');
+    else if (themeName && themeName !== 'light') document.body.classList.add(`theme-${themeName}`);
     panel.querySelectorAll('.theme-btn').forEach(btn => btn.classList.remove('active'));
     panel.querySelector(`.theme-btn[data-theme="${themeName}"]`)?.classList.add('active');
     try { localStorage.setItem(THEME_KEY, themeName); } catch (e) {}
 
+    // カラーテーマは全て白文字ステータスバー（black-translucent）。黒文字はライトのみ。
+    // （この値はiOSがホーム画面追加時にキャッシュするため実行中の変更は効かないが、
+    //   時計の文字色は theme-color の明暗でiOSが動的に決めるので、リロードは行わない）
     const isDarkStyleStatusBar = ['dark', 'red'].includes(themeName);
     const statusBar = document.getElementById('status-bar-style');
     const themeColorMeta = document.getElementById('theme-color-meta');
-    
+
     if (statusBar) {
       statusBar.content = isDarkStyleStatusBar ? 'black-translucent' : 'default';
     }
+
     if (themeColorMeta) {
-      let color = '#f9fafe'; // default (light)
-      if (themeName === 'dark') color = '#22272e';
-      else if (themeName === 'red') color = '#e60046';
+      // iOSはtheme-colorの明るさでステータスバーの文字色(黒/白)を自動決定するため、
+      // カラーテーマでは白文字判定になる濃色を渡す（index.html冒頭のスクリプトと同期）
+      let color = '#f9fafe';
+      switch (themeName) {
+        case 'dark':   color = '#000000'; break;
+        case 'red':    color = '#8c002b'; break;
+      }
       themeColorMeta.content = color;
+    }
+
+    let bodyBg = '';
+    switch (themeName) {
+      case 'dark':   bodyBg = '#000000'; break;
+      case 'red':    bodyBg = '#e60046'; break;
     }
 
     const earlyStyle = document.getElementById('early-theme-style');
     if (earlyStyle) {
-      let bodyBg = '';
-      if (themeName === 'dark') bodyBg = '#22272e';
-      else if (themeName === 'red') bodyBg = '#e60046';
-
-      if (bodyBg) {
-        earlyStyle.textContent = 'html, body, #loading-screen { background-color: ' + bodyBg + ' !important; }';
-      } else {
-        earlyStyle.textContent = '';
-      }
+      earlyStyle.textContent = bodyBg
+        ? 'html, body, #loading-screen { background-color: ' + bodyBg + ' !important; }'
+        : '';
     }
+    // html要素のインライン背景（初回チラつき防止用）もテーマ切替に追従させ、
+    // カラーテーマ→ライトへ戻したときに古い色が残らないようにする。
+    document.documentElement.style.backgroundColor = bodyBg || '#f9fafe';
+
+    // color-scheme もテーマに追従（ダーク時はエンジン既定色を黒にして
+    // 次回起動時の一瞬の白を防ぐ。index.html冒頭の動的メタと同期）
+    const csMeta = document.getElementById('color-scheme-meta');
+    if (csMeta) csMeta.content = themeName === 'dark' ? 'dark' : 'light';
+    document.documentElement.style.colorScheme = themeName === 'dark' ? 'dark' : 'light';
   };
 
   toggleBtn.addEventListener('click', e => { e.stopPropagation(); panel.classList.toggle('show'); });
@@ -1650,13 +2412,50 @@ function setupThemeSwitcher() {
   panel.addEventListener('click', e => {
     const themeBtn = e.target.closest('.theme-btn');
     if (themeBtn) {
-      applyTheme(themeBtn.dataset.theme);
+      applyTheme(themeBtn.dataset.theme, { fromUser: true });
       panel.classList.remove('show');
     }
   });
 
   try { applyTheme(localStorage.getItem(THEME_KEY) || 'light'); } catch (e) { applyTheme('light'); }
+
+  // ほかのタブ（や手元の編集ツールのプレビュー）でテーマを変えたら、このタブも同じ色にする
+  window.addEventListener('storage', (e) => {
+    if (e.key === THEME_KEY && e.newValue) applyTheme(e.newValue);
+    // 別のタブでタイムスタンプを登録・削除したら読み直す。読み直さないと、このタブで次に保存したとき
+    // 古い内容で丸ごと上書きして、別のタブで登録した分が消えていた
+    if (e.key === TS_KEY) {
+      timestamps = loadTimestamps();
+      document.querySelectorAll('#results .episode-item').forEach(updateFavStar);
+      if (showFavoritesOnly) { isRestoringURL = true; search({ gotoPage: currentPage }); isRestoringURL = false; }
+    }
+  });
 }
+
+// モーダル（このサイトについて・沿革・関連リンク・タイムスタンプ）を開いている間は、後ろのページへ Tab で移れないようにし、
+// 開いたらモーダルの中へ、閉じたら開いたボタンへフォーカスを移す（キーボード・読み上げで操作したときに迷わないように）
+const modalFocus = {
+  open(modal) {
+    if (modal.__focusCtx) return;
+    const opener = document.activeElement;
+    const off = [...document.body.children].filter(el => el !== modal && !el.contains(modal) && !el.inert && !/^(SCRIPT|STYLE|LINK)$/.test(el.tagName));
+    off.forEach(el => { el.inert = true; });
+    modal.__focusCtx = { opener, off };
+    setTimeout(() => {
+      if (!modal.__focusCtx) return;
+      const f = modal.querySelector('.modal-close, [id$="CloseBtn"], button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+      if (f) f.focus({ preventScroll: true });
+    }, 60);
+  },
+  close(modal) {
+    const ctx = modal.__focusCtx;
+    if (!ctx) return;
+    modal.__focusCtx = null;
+    ctx.off.forEach(el => { el.inert = false; });
+    if (ctx.opener && ctx.opener.isConnected && typeof ctx.opener.focus === 'function') ctx.opener.focus({ preventScroll: true });
+  }
+};
+
 
 function setupModals() {
     const setup = (modalId, openTriggerId, closeBtnId) => {
@@ -1664,10 +2463,11 @@ function setupModals() {
         const modalContent = modal ? modal.querySelector('.modal-content, #aboutModalContent') : null;
         const openTrigger = document.getElementById(openTriggerId);
         const closeBtn = document.getElementById(closeBtnId);
-        if (!modal || !openTrigger || !closeBtn || !modalContent) return { openModal: ()=>{}, closeModal: ()=>{} };
+        if (!modal || !closeBtn || !modalContent) return { openModal: ()=>{}, closeModal: ()=>{} }; // openTriggerはnull許容に変更
 
         const openModal = () => {
             if (modal.classList.contains('show') || modal.classList.contains('closing')) return;
+
             modal.classList.remove('show');
             modal.classList.remove('closing');
             void modal.offsetWidth;
@@ -1676,68 +2476,625 @@ function setupModals() {
                 buildTimeline(historyData);
                 modal.dataset.built = 'true';
             }
+
             modal.hidden = false;
+
+            // ★追加: アニメーション開始前に一瞬だけ不可視状態で配置し、フォント計算を強制させる
+            modal.style.display = 'flex';
+            modal.style.opacity = '0';
+            void modal.offsetWidth; // 強制リフロー（ここでフォントが適用される）
+
             requestAnimationFrame(() => {
+                modal.style.display = ''; // インラインスタイルを消してCSSに任せる
+                modal.style.opacity = '';
                 modal.classList.add('show');
+                // 表示が始まってから、後ろを操作できなくする（表示されないまま後ろだけ止まることがないように）
+                modalFocus.open(modal);
             });
             window.acquireBodyLock();
         };
+        
         const closeModal = () => {
+            // 閉じ始めた時点で、後ろのページを操作できるように戻し、開いたボタンへフォーカスを戻す
+            modalFocus.close(modal);
             if (!modal.classList.contains('show')) return;
+        
             modal.classList.add('closing');
             modal.classList.remove('show');
+        
             let isClosed = false;
+        
             const finishClose = () => {
                 if (isClosed) return;
                 isClosed = true;
+        
                 modal.hidden = true;
                 modal.classList.remove('closing');
                 modal.removeEventListener('animationend', onAnimationEnd);
+                
                 window.releaseBodyLock();
+                modalFocus.close(modal);
             };
+        
             const onAnimationEnd = (e) => {
-                if (e.target === modal) finishClose();
+                if (e.target === modal) {
+                    finishClose();
+                }
             };
+        
             modal.addEventListener('animationend', onAnimationEnd);
             setTimeout(finishClose, 300);
         };
-        openTrigger.addEventListener('click', e => { e.preventDefault(); openModal(); });
+        
+        if(openTrigger) {
+            openTrigger.addEventListener('click', e => { e.preventDefault(); openModal(); });
+        }
         closeBtn.addEventListener('click', closeModal);
         modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+        
         return { openModal, closeModal };
     };
+
     const { closeModal: closeAbout } = setup('aboutModal', 'aboutSiteLink', 'aboutCloseBtn');
     const { closeModal: closeHistory } = setup('historyModal', 'historyToggle', 'historyCloseBtn');
+    
+    // ★追加: フォトメモリンク用モーダルのセットアップ
+    const { openModal: openPhoto, closeModal: closePhoto } = setup('photoModal', null, 'photoCloseBtn');
+
+    // ★追加: タイムスタンプ登録モーダルのセットアップ
+    const { openModal: openTs, closeModal: closeTs } = setup('tsModal', null, 'tsCloseBtn');
+    let tsCtx = null; // { id, link, cardEl, durationSec, editing, wasFav }
+    // iOSはキーボード表示時にスクロールロックを無視してページを動かすため、
+    // モーダルを開いた時点の位置を記憶し、キーボード終了時に戻す
+    let tsSavedScrollY = 0;
+    const instantScrollTo = (y) => {
+      // scroll-behavior: smooth の影響を受けず一瞬で移動する
+      const html = document.documentElement;
+      const prev = html.style.scrollBehavior;
+      html.style.scrollBehavior = 'auto';
+      window.scrollTo(0, y);
+      html.style.scrollBehavior = prev;
+    };
+    const restoreTsScroll = () => {
+      if (Math.abs(window.scrollY - tsSavedScrollY) > 1) {
+        instantScrollTo(tsSavedScrollY);
+      }
+    };
+    // 閉じた後の遅延スクロール復元は、iOSがキーボードを閉じる際に起こす不本意な
+    // ページずれを元に戻すためのもの。ただしユーザーが自分でスクロールした場合は
+    // その操作を尊重して復元を中止する（閉じた直後にスクロールすると戻される不具合の対策）。
+    let tsRestoreTimers = [];
+    const cancelTsScrollRestore = () => {
+      tsRestoreTimers.forEach(clearTimeout);
+      tsRestoreTimers = [];
+      window.removeEventListener('wheel', onTsUserScroll);
+      window.removeEventListener('touchstart', onTsUserScroll);
+      window.removeEventListener('touchmove', onTsUserScroll);
+      window.removeEventListener('keydown', onTsScrollKey);
+    };
+    function onTsUserScroll() {
+      // body固定中（モーダル表示中のスマホ）はページ自体がスクロールできないため、
+      // モーダル内のタップで復元を中止しない。中止するとキーボード終了時の
+      // パン残留が残ったまま次のフォーカスが始まり、表示位置が経路でずれる。
+      // （中止はモーダルを閉じた後にユーザーが自分でスクロールした場合の保護）
+      if (document.body.classList.contains('ts-kb-lock')) return;
+      cancelTsScrollRestore();
+    }
+    function onTsScrollKey(e) {
+      // スクロール系キー操作もユーザー意思とみなす
+      if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' ','Spacebar'].includes(e.key)) cancelTsScrollRestore();
+    }
+    const scheduleTsScrollRestore = () => {
+      cancelTsScrollRestore();
+      // touchstart はスワイプ開始を即検知（閉じた直後にすぐ触っても取りこぼさない）
+      window.addEventListener('wheel', onTsUserScroll, { passive: true });
+      window.addEventListener('touchstart', onTsUserScroll, { passive: true });
+      window.addEventListener('touchmove', onTsUserScroll, { passive: true });
+      window.addEventListener('keydown', onTsScrollKey);
+      tsRestoreTimers.push(setTimeout(restoreTsScroll, 150));
+      tsRestoreTimers.push(setTimeout(() => { restoreTsScroll(); cancelTsScrollRestore(); }, 450));
+    };
+
+    // スマホ（ボトムシート表示）ではさらに強い固定を使う:
+    // bodyをposition:fixedにすると、iOSが「入力欄を見せるため」に行う
+    // ページスクロール自体が物理的に不可能になり、背景が一切動かなくなる。
+    const lockTsBody = () => {
+      if (document.body.classList.contains('ts-kb-lock')) return;
+      if (!window.matchMedia('(max-width: 600px)').matches) return;
+      document.body.style.top = `-${tsSavedScrollY}px`;
+      document.body.classList.add('ts-kb-lock');
+    };
+    const unlockTsBody = () => {
+      if (!document.body.classList.contains('ts-kb-lock')) return;
+      document.body.classList.remove('ts-kb-lock');
+      document.body.style.top = '';
+      instantScrollTo(tsSavedScrollY); // 固定解除で0に飛ぶので即座に元の位置へ
+    };
+
+    const tsEls = () => ({
+      input: document.getElementById('tsInput'),
+      addArea: document.querySelector('#tsModal .ts-add-area'),
+      addBtn: document.getElementById('tsAddBtn'),
+      copyBtn: document.getElementById('tsCopyBtn'),
+      cancelBtn: document.getElementById('tsCancelBtn'),
+      listActions: document.getElementById('tsListActions'),
+      clearAllBtn: document.getElementById('tsClearAllBtn'),
+      list: document.getElementById('tsList'),
+      error: document.getElementById('tsError'),
+      footer: document.querySelector('#tsModal .ts-footer'),
+    });
+
+    // 複数行テキストを一括解析。エラー行は理由付きで返す。
+    const parseTsLines = (text, durationSec) => {
+      const entries = [], errors = [];
+      const lines = text.split('\n');
+      lines.forEach((rawLine, i) => {
+        const line = rawLine.trim();
+        if (!line) return; // 空行は無視
+        const parsed = parseTsInput(line);
+        if (!parsed) {
+          // 時間表記で始まらない行は「時間指定なしのメモ」として登録する
+          entries.push({ t: null, label: line });
+        } else if (durationSec != null && parsed.t > durationSec) {
+          errors.push({ line: i + 1, text: line, reason: `再生時間（${formatTs(durationSec)}）を超えています` });
+        } else {
+          entries.push(parsed);
+        }
+      });
+      return { entries, errors };
+    };
+
+    const showTsError = (errors) => {
+      const { error, input } = tsEls();
+      const items = errors.slice(0, 4).map(e =>
+        `<div class="ts-error-line"><i class="fa-solid fa-circle-exclamation"></i> ${errors.length > 1 || e.line > 1 ? `${e.line}行目: ` : ''}${e.reason}</div>`
+      ).join('');
+      const more = errors.length > 4 ? `<div class="ts-error-line">…他${errors.length - 4}件</div>` : '';
+      error.innerHTML = items + more;
+      error.hidden = false;
+      input.classList.add('ts-input-error');
+      setTimeout(() => input.classList.remove('ts-input-error'), 500);
+      autosizeTsInput(); // エラーが入力欄とボタンの間に挟まり上限が縮むため再計算
+    };
+
+    const clearTsError = () => { const { error } = tsEls(); error.hidden = true; error.innerHTML = ''; };
+
+    // テキストエリアの高さを内容に合わせる。上限はスマホでは約6行（152px）、
+    // PC/iPad（601px以上）ではモーダルの空きスペース＝キャンセル/保存ボタンが
+    // モーダル下端に達するまで。上限を超えた分は内部スクロールになる。
+    // scrollHeight参照は強制リフローを起こすため、rAFで1フレーム1回に間引いて軽量化。
+    const tsInputMaxHeight = () => {
+      // ★変更: スマホでも「モーダルの空きスペース」まで入力欄を広げる。
+      // 編集モード中はエピソードカード（.ts-editing）とリスト・フッターが
+      // 非表示になり .ts-body が flex:1 で広がるため、空いた分がそのまま
+      // 入力欄の上限に反映される（従来のスマホは152px固定だった）。
+      // キーボード表示時は interactive-widget=resizes-content でシートが縮み、
+      // clientHeight 経由で上限も自動的に追従する。
+      // .ts-body は flex:1 で高さが固定されているため、入力欄の高さに影響されず
+      // 「ボタン・余白を除いた空きスペース」を安定して算出できる
+      const body = document.querySelector('#tsModal .ts-body');
+      const { addArea, error } = tsEls();
+      const actions = addArea ? addArea.querySelector('.ts-actions') : null;
+      if (!body || !actions) return 152;
+      const bs = getComputedStyle(body);
+      const gap = parseFloat(getComputedStyle(addArea).rowGap) || 0;
+      let free = body.clientHeight
+        - parseFloat(bs.paddingTop) - parseFloat(bs.paddingBottom)
+        - actions.offsetHeight - gap;
+      // エラー表示は入力欄とボタンの間に挟まるため、その高さと区切りgapも差し引く
+      if (error && !error.hidden) free -= error.offsetHeight + gap;
+      // ★スマホの上限: 152px（約6行・従来サイズ）。
+      // 260px→200px→152pxと段階的に調整した結果、従来サイズが最も好評だったため戻した。
+      // 編集中のエピソードカード非表示は維持（この数値だけで再調整可能）。
+      // ヘッダー＋入力欄＋ボタンが常にキーボード表示後の画面にも収まり、
+      // キーボード表示でレイアウトが動く余地もない。
+      // PCは従来どおりモーダルの空きスペースまで。
+      if (!window.matchMedia('(min-width: 601px)').matches) {
+        return 152;
+      }
+      return Math.max(152, free);
+    };
+    let autosizeRafId = 0;
+    const applyTsAutosize = () => {
+      const { input } = tsEls();
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, tsInputMaxHeight()) + 'px';
+    };
+    const autosizeTsInput = () => {
+      if (autosizeRafId) return;
+      autosizeRafId = requestAnimationFrame(() => {
+        autosizeRafId = 0;
+        applyTsAutosize();
+      });
+    };
+
+    const setEditingMode = (on) => {
+      const { input, addArea, cancelBtn, copyBtn, listActions, list, footer } = tsEls();
+      tsCtx.editing = on;
+      // ★スマホ版: 編集モードの間（編集タップ〜保存/キャンセルまで）は
+      // エピソードカードを非表示にして、その分入力欄を広く使う（CSS側で
+      // .ts-editing を600px以下のみ非表示条件にしている。PCは従来どおり表示）
+      const sheet = document.querySelector('#tsModal .ts-modal');
+      if (sheet) sheet.classList.toggle('ts-editing', on);
+      // 入力欄と保存ボタンは「編集」をタップした時だけ表示する。
+      // 通常時は一覧だけを見せて、登録・変更はすべて編集モード経由に一本化。
+      addArea.hidden = !on;
+      cancelBtn.hidden = !on;
+      hideClearConfirm();
+      // 編集中は入力欄に集中できるよう、登録済みリストと
+      // 下部固定エリア（編集/すべて削除・ヒント文）ごと非表示にする
+      listActions.hidden = on;
+      list.hidden = on;
+      footer.hidden = on;
+      input.value = on ? tsEntriesToText(getTimestamps(tsCtx.id)) : '';
+      copyBtn.disabled = !input.value.trim(); // 空の下書きはコピー不可
+      autosizeTsInput();
+      clearTsError();
+      syncTsBodyScrollbar();
+    };
+
+    // スクロールバーが幅を取る環境（PC/iPad等）で、右paddingを実測のバー幅ぶん
+    // 詰めて、固定表示のカード/フッターと左右位置を揃える。CSS側の
+    // scrollbar-gutter: stable でバー領域は件数によらず常に確保されるため、
+    // ここの補正値も件数で変化せず、リスト行の横幅は常に一定になる。
+    // オーバーレイスクロールバー環境（バー幅0）では何もしない。
+    let tsSbwRafId = 0;
+    const syncTsBodyScrollbar = () => {
+      if (tsSbwRafId) return;
+      tsSbwRafId = requestAnimationFrame(() => {
+        tsSbwRafId = 0;
+        const body = document.querySelector('#tsModal .ts-body');
+        if (!body) return;
+        const sbw = body.offsetWidth - body.clientWidth; // 実際に占有しているバー幅
+        // 基準の右paddingはCSSと連動させる（スマホ15px / PC20px。固定20だと
+        // スマホで左右の余白が非対称になり、トップ画面カードと揃わない）
+        const basePad = window.matchMedia && window.matchMedia('(max-width: 600px)').matches ? 15 : 20;
+        body.style.paddingRight = sbw > 0 ? Math.max(8, basePad - sbw) + 'px' : '';
+      });
+    };
+    window.addEventListener('resize', () => {
+      syncTsBodyScrollbar();
+      // PCでは入力欄の高さ上限がモーダルの空きスペース依存のため、編集中は再計算する
+      if (tsCtx && tsCtx.editing) autosizeTsInput();
+    });
+
+    // 件数が多くても軽いように、リストは変更確定時に1回だけ組み立てる
+    // すべて削除の確認パネル（ブラウザ標準confirmの代替）
+    const hideClearConfirm = () => {
+      const panel = document.getElementById('tsClearConfirm');
+      if (panel && !panel.hidden) panel.hidden = true;
+    };
+
+    // 一覧のテキスト化（まとめて編集の下書き・コピー機能で共用。
+    // 時間指定なしのメモはラベルのみで書き出し、再解析時も時間なしとして扱われる）
+    const tsEntriesToText = (entries) =>
+      entries.map(e => e.t == null ? e.label : `${formatTs(e.t)} ${e.label}`.trimEnd()).join('\n');
+
+    const renderTsList = () => {
+      const { list, listActions, clearAllBtn } = tsEls();
+      const items = getTimestamps(tsCtx.id);
+      hideClearConfirm(); // リストが変わったら確認パネルは一旦閉じる
+      // 編集ボタンが登録の入口なので、0件でもボタン行は表示する（すべて削除だけ隠す）
+      listActions.hidden = tsCtx.editing;
+      clearAllBtn.hidden = items.length === 0;
+      syncTsBodyScrollbar(); // 件数変化でスクロールバーの有無が変わるため毎回同期
+      if (items.length === 0) {
+        list.innerHTML = '<li class="ts-empty"><span class="ts-empty-main"><i class="fa-regular fa-clock"></i> まだ登録がありません</span><span class="ts-empty-sub">「編集」からタイムスタンプやメモを登録できます</span></li>';
+        return;
+      }
+      // AuDeeは時間指定再生に対応していないため、時間は表記のみ（リンクはエピソードURLそのまま）
+      const epLink = escapeHtml(tsCtx.link);
+      list.innerHTML = items.map((item, i) => {
+        const noTime = item.t == null;
+        const timeHtml = `<span class="ts-time"><i class="fa-solid fa-play"></i><span class="impact-number">${noTime ? '??:??' : formatTs(item.t)}</span></span>`;
+        return `
+        <li class="ts-item">
+          <a class="ts-play" href="${epLink}" target="_blank" rel="noopener" aria-label="${noTime ? 'エピソードを開く' : `${formatTs(item.t)} の場面（エピソードを開く）`}">
+            ${timeHtml}
+            <span class="ts-label">${item.label ? escapeHtml(item.label) : '<span class="ts-label-none">（メモなし）</span>'}</span>
+          </a>
+          <button class="ts-delete" data-index="${i}" aria-label="このタイムスタンプを削除" title="削除"><i class="fa-solid fa-trash-can"></i></button>
+        </li>`;
+      }).join('');
+    };
+
+    // 変更確定後の同期。全件再検索はお気に入り状態が変わった時だけに絞り、負荷を抑える。
+    const syncAfterTsChange = () => {
+      if (tsCtx.cardEl && tsCtx.cardEl.isConnected) updateFavStar(tsCtx.cardEl);
+      const nowFav = isFavorite(tsCtx.id);
+      if (showFavoritesOnly && nowFav !== tsCtx.wasFav) {
+        search({ gotoPage: currentPage });
+      }
+      tsCtx.wasFav = nowFav;
+    };
+
+    window.openTsModal = (favId, title, link, cardEl, duration) => {
+      if (!favId) return;
+      tsSavedScrollY = window.scrollY;
+      lockTsBody();
+      tsCtx = { id: favId, link, cardEl, durationSec: durationToSec(duration), editing: false, wasFav: isFavorite(favId) };
+      // タイトルはエピソード名なし（どの回かは直下のエピソードカードで分かる）
+      document.getElementById('tsModalTitle').textContent = 'タイムスタンプ';
+
+      // どの回への登録か一目で分かるよう、トップ画面と全く同じエピソードカードを表示する。
+      // （renderResultsと同じ buildEpisodeCardLink を使い、同じCSSを適用させる。
+      //   ★ボタン/リンクボタン等の操作系だけ除外）
+      const epCard = document.getElementById('tsEpisodeCard');
+      if (epCard) {
+        const epItem = data.find(it => it.favId === favId);
+        if (epItem) {
+          epCard.innerHTML = `<li class="episode-item" style="--i:0;">${buildEpisodeCardLink(epItem)}</li>`;
+          epCard.hidden = false;
+        } else {
+          epCard.hidden = true;
+        }
+      }
+      setEditingMode(false);
+      renderTsList();
+      openTs();
+      // ★点滅対策: openTs()の時点でモーダルは display:flex + opacity:0 になっており
+      // 幅が計測可能。ここで「同期的に」文字フィットを確定させることで、
+      // モーダルが見え始める最初のフレームから完成した状態で表示される。
+      // （従来はrAF×2の遅延フィットだったため、遅い端末ではモーダルが見えた後に
+      //   公開日時・動画時間の文字が現れて点滅のように見えていた）
+      fitGuestLines();
+    };
+
+    const submitTs = () => {
+      const { input } = tsEls();
+      // 空のまま登録: 変更せず一覧に戻る（全削除は確認付きの「すべて削除」経由に限定し、誤消去を防ぐ）
+      if (!input.value.trim()) { setEditingMode(false); endTypingModeNow(); return; }
+      const { entries, errors } = parseTsLines(input.value, tsCtx.durationSec);
+      if (errors.length > 0) { showTsError(errors); return; } // エラー時は入力を続けられるようフォーカス維持
+      // 完全に同じ行（時間+メモ）が複数あっても1件にまとめる
+      const seen = new Set();
+      const unique = entries.filter(e => {
+        const key = `${e.t}|${e.label}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      setTimestampsAll(tsCtx.id, unique); // 入力欄の内容で全置換（登録・編集とも同じ経路）
+      setEditingMode(false);
+      renderTsList();
+      syncAfterTsChange();
+      // 登録成功: キーボードを閉じ、待ち時間なしで結果の一覧を見せる
+      endTypingModeNow();
+    };
+
+    document.getElementById('tsAddBtn').addEventListener('click', submitTs);
+    document.getElementById('tsCancelBtn').addEventListener('click', () => {
+      setEditingMode(false);
+      endTypingModeNow(); // キャンセル時もキーボードを閉じて即座に一覧へ戻す
+    });
+    // 入力欄の内容（下書き）をコピー。編集直後の下書きは登録済み一覧そのものなので、
+    // 「登録した一覧をコピーする」用途もこのボタン1つでまかなえる
+    let tsCopyResetTimer = 0;
+    document.getElementById('tsCopyBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('tsCopyBtn');
+      const text = tsEls().input.value.trim();
+      if (!text) return;
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch (_) {
+        // 非対応環境用: 画面外のreadonly要素で選択コピー（キーボードを出さない）
+        const tmp = document.createElement('textarea');
+        tmp.value = text;
+        tmp.setAttribute('readonly', '');
+        tmp.style.cssText = 'position:fixed;left:-9999px;top:0;';
+        document.body.appendChild(tmp);
+        tmp.select();
+        try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
+        tmp.remove();
+      }
+      if (!copied) return;
+      // アイコンを一瞬チェックに変えてフィードバック
+      btn.innerHTML = '<i class="fa-solid fa-check"></i>';
+      clearTimeout(tsCopyResetTimer);
+      tsCopyResetTimer = setTimeout(() => {
+        btn.innerHTML = '<i class="fa-regular fa-copy"></i>';
+      }, 1400);
+    });
+    document.getElementById('tsEditAllBtn').addEventListener('click', () => {
+      setEditingMode(true);
+      // 高さ調整はrAF待ちのため、フォーカス前に確定させる。未確定のままだと
+      // iOSがキーボード表示時に計算するスクロール量が入力欄を直接タップした
+      // 時と変わり、モーダルの表示位置が経路によってずれる。
+      applyTsAutosize();
+      tsEls().input.focus();
+    });
+    document.getElementById('tsClearAllBtn').addEventListener('click', () => {
+      if (getTimestamps(tsCtx.id).length === 0) return;
+      // サイト内の確認パネルを表示（コピー/すべて削除の行と入れ替え）
+      tsEls().listActions.hidden = true;
+      const panel = document.getElementById('tsClearConfirm');
+      panel.hidden = false;
+      panel.scrollIntoView({ block: 'nearest' });
+    });
+    document.getElementById('tsClearCancelBtn').addEventListener('click', () => {
+      hideClearConfirm();
+      tsEls().listActions.hidden = tsCtx.editing;
+    });
+    document.getElementById('tsClearOkBtn').addEventListener('click', () => {
+      setTimestampsAll(tsCtx.id, []);
+      renderTsList(); // 内部で確認パネルも閉じる
+      syncAfterTsChange();
+    });
+
+    document.getElementById('tsInput').addEventListener('input', () => {
+      clearTsError();
+      autosizeTsInput();
+      const { input, copyBtn } = tsEls();
+      copyBtn.disabled = !input.value.trim();
+    });
+    document.getElementById('tsList').addEventListener('click', e => {
+      const delBtn = e.target.closest('.ts-delete');
+      if (delBtn) {
+        e.preventDefault();
+        removeTimestamp(tsCtx.id, Number(delBtn.dataset.index));
+        renderTsList();
+        syncAfterTsChange();
+        if (tsCtx.editing) setEditingMode(true); // 編集中なら下書きも最新化
+      }
+    });
+
+    /* キーボード対応（iOS Safari/PWA・Android共通の「コンポーズモード」方式）:
+     * visualViewport等のビューポート計算による位置合わせは、実機iOSのパンや
+     * offsetTop残留バグ等で不安定だったため全廃した。
+     * 代わりに「入力中はシートを全画面化し、リスト・エピソードカードを畳んで
+     * 入力欄を画面上部に置く」。入力欄と保存ボタンが常に画面上部にあるため、
+     * キーボードがどう出ても（入力欄が6行まで伸びても）物理的に隠れない。
+     * （Android等のresizes-content対応環境ではdvhが縮み、同じく自然に収まる） */
+    const tsSheetEl = document.querySelector('#tsModal .ts-modal');
+    const tsInputEl = document.getElementById('tsInput');
+    let typingEndTimer = 0;
+    // キーボード表示直後の位置補正: iOSは入力欄が隠れていなくてもページを不定量
+    // パンすることがある。
+    // ★改善: 以前は250ms/600msの2回だけ戻していたため「ずれてから戻る」動きが
+    // 見えていた。キーボードが出きるまでの約900ms、毎フレーム(16ms間隔)監視して
+    // ずれた瞬間に打ち消すことで、動き自体が視認できないようにする。
+    let tsTypingFixToken = 0;
+    const cancelTsTypingPanFix = () => { tsTypingFixToken++; };
+    const scheduleTsTypingPanFix = () => {
+      const token = ++tsTypingFixToken;
+      const t0 = performance.now();
+      const tick = () => {
+        if (token !== tsTypingFixToken) return; // キャンセル済み
+        if (!tsSheetEl.classList.contains('ts-typing')) return; // 入力終了
+        if (document.body.classList.contains('ts-kb-lock') && window.scrollY !== 0) {
+          instantScrollTo(0);
+        }
+        if (performance.now() - t0 < 900) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    };
+    const startTypingMode = () => {
+      if (!window.matchMedia('(max-width: 600px)').matches) return; // ボトムシート時のみ
+      clearTimeout(typingEndTimer);
+      tsSheetEl.classList.add('ts-typing');
+      scheduleTsTypingPanFix();
+      autosizeTsInput(); // キーボード表示中は上限が変わる（フルに使う）ため再計算
+    };
+    const endTypingMode = () => {
+      clearTimeout(typingEndTimer);
+      cancelTsTypingPanFix();
+      // blur直後のタップ（登録ボタン等）がレイアウト変化で外れないよう少し待ってから戻す
+      typingEndTimer = setTimeout(() => {
+        tsSheetEl.classList.remove('ts-typing');
+        autosizeTsInput(); // キーボードが閉じたら45%上限に戻して再計算
+      }, 150);
+    };
+    // 登録・キャンセルの確定時用: 150msの猶予を待たずに即座に通常表示へ戻す。
+    // （猶予中は入力欄もリストも全部隠れた状態になり、画面が一瞬白く見えるため）
+    const endTypingModeNow = () => {
+      tsInputEl.blur(); // iOSはボタンタップでblurしないため明示的に閉じる
+      clearTimeout(typingEndTimer);
+      cancelTsTypingPanFix();
+      tsSheetEl.classList.remove('ts-typing');
+    };
+    tsInputEl.addEventListener('focus', startTypingMode);
+    tsInputEl.addEventListener('blur', () => {
+      endTypingMode();
+      scheduleTsScrollRestore(); // 万一ページがずらされていても元へ（ユーザー操作時は中止）
+    });
+    // iOSはボタンや余白をタップしても入力欄のフォーカスが外れないため、
+    // コンポーズモード中にシート内の入力欄以外へ触れたらキーボードを閉じる
+    tsSheetEl.addEventListener('pointerdown', (e) => {
+      if (!tsSheetEl.classList.contains('ts-typing')) return;
+      if (e.target === tsInputEl || tsInputEl.contains(e.target)) return;
+      // アクション行（キャンセル/コピー/保存）はここではblurしない。
+      // pointerdownでblurするとキーボードが閉じてレイアウトが動き、指の下からボタンが
+      // ずれてclickが外れる＝ボタンが押せない（iOS Safari）。keyboardはclickの各ハンドラ
+      // （submitTs / キャンセル）が endTypingModeNow() で閉じるので取りこぼさない。
+      if (e.target.closest('.ts-actions')) return;
+      tsInputEl.blur();
+    });
+    // モーダルを閉じる操作時はキーボードも閉じ、body固定を解除して位置を戻す
+    const resetTsKeyboard = () => {
+      tsInputEl?.blur();
+      clearTimeout(typingEndTimer);
+      cancelTsTypingPanFix();
+      tsSheetEl.classList.remove('ts-typing');
+      unlockTsBody();
+      // キーボードの閉じアニメーション後にも復元（ユーザーが自分でスクロールしたら中止）
+      scheduleTsScrollRestore();
+    };
+    document.getElementById('tsCloseBtn').addEventListener('click', resetTsKeyboard);
+    document.getElementById('tsModal').addEventListener('click', e => {
+      if (e.target === e.currentTarget) resetTsKeyboard();
+    });
+    
+    // リンク一覧モーダル（フォトメモリンク／スタジオオンショットで共用）。
+    // links: [{ label, url, date? }] … アイコンはリンク先のサービスから自動で決める
+    const linkIconFor = (url) => {
+      const u = String(url || '').toLowerCase();
+      if (u.includes('instagram.com')) return '<i class="fa-brands fa-instagram"></i>';
+      if (u.includes('x.com') || u.includes('twitter.com')) return '<i class="fa-brands fa-x-twitter"></i>';
+      if (u.includes('tiktok.com')) return '<i class="fa-brands fa-tiktok"></i>';
+      if (u.includes('youtube.com') || u.includes('youtu.be')) return '<i class="fa-brands fa-youtube"></i>';
+      return '<i class="fa-solid fa-link"></i>';
+    };
+    // 番号・英数字はImpactフォントで表示して統一感を出す（エスケープ後に装飾する）
+    const impactify = (text) => impactifyHtml(decodeEntities(text));
+    // リンク名は本文のフォントのまま。データ中の <br> だけは改行として扱う
+    const linkLabelHtml = (text) => escapeHtml(decodeEntities(text)).replace(/&lt;br\s*\/?&gt;/gi, '<br>');
+    const openLinkList = (title, links) => {
+      const body = document.getElementById('photoBody');
+      const titleEl = document.getElementById('photoModalTitle');
+      if (titleEl) titleEl.textContent = title;
+      body.innerHTML = links.filter(l => l && l.url).map(link => `
+          <a href="${escapeHtml(link.url)}" target="_blank" rel="noopener" class="photo-link-btn">
+            <span class="photo-link-icon">${linkIconFor(link.url)}</span>
+            <span class="photo-link-text">${link.date ? `<span class="photo-link-date">${impactify(String(link.date).replace(/-/g, '.'))}</span>` : ''}${linkLabelHtml(link.label)}</span>
+          </a>
+        `).join('') || '<p class="photo-link-empty">現在登録されているリンクはありません。</p>';
+      body.scrollTop = 0;
+      openPhoto();
+    };
+
+    // グローバルから呼べるようにする
+    window.openPhotoModal = (ep) => {
+      const pm = photoMemoryData[ep];
+      openLinkList('フォトメモリンク', (pm && Array.isArray(pm.links)) ? pm.links : []);
+    };
+    window.openOnshotModal = () => {
+      openLinkList('スタジオオンショット', onshotData);
+    };
+
     document.addEventListener('keydown', e => {
         if (e.key === 'Escape') {
-            if (document.getElementById('aboutModal').classList.contains('show')) closeAbout();
-            if (document.getElementById('historyModal').classList.contains('show')) closeHistory();
+            if (document.getElementById('aboutModal')?.classList.contains('show')) closeAbout();
+            if (document.getElementById('historyModal')?.classList.contains('show')) closeHistory();
+            if (document.getElementById('photoModal')?.classList.contains('show')) closePhoto(); // ★追加
+            if (document.getElementById('tsModal')?.classList.contains('show')) { resetTsKeyboard(); closeTs(); } // ★追加: タイムスタンプ
+            // スマホ・タブレットのフィルタ画面も Esc で閉じる（PCは常に出ている左の列なので対象外）
+            const drawer = document.getElementById('filterDrawer');
+            if (window.innerWidth < 1070 && drawer && getComputedStyle(drawer).display !== 'none' && typeof window.toggleFilterDrawer === 'function') {
+                window.toggleFilterDrawer(false);
+            }
         }
     });
+
+    // ★追加: ひすとりーモーダルの内容を裏で事前に構築しておく（初回起動時のチラつき防止）
+    const historyModal = document.getElementById('historyModal');
+    if (historyModal && historyData && historyData.length > 0 && !historyModal.dataset.built) {
+        buildTimeline(historyData);
+        historyModal.dataset.built = 'true';
+    }
 }
 
 function setupShareButtons() {
-  const shareUrl = 'https://ikumi-searchtheradio.com/';
+  const shareUrl = 'https://searchtheradio.com/hasegawa-ikumi/';
   const text = '長谷川育美非公式サイト(検) #長谷川育美非公式';
-  
   const u = encodeURIComponent(shareUrl);
   const t = encodeURIComponent(text);
-  
-  const xBtn = document.getElementById('shareX');
-  const lineBtn = document.getElementById('shareLINE');
-  const fbBtn = document.getElementById('shareFB');
-
-  // ボタンが存在する場合のみリンクを設定（エラー防止）
-  if (xBtn) xBtn.href = `https://x.com/intent/tweet?url=${u}&text=${t}`;
-  if (lineBtn) lineBtn.href = `https://social-plugins.line.me/lineit/share?url=${u}`;
-  if (fbBtn) fbBtn.href = `https://www.facebook.com/sharer/sharer.php?u=${u}`;
+  document.getElementById('shareX').href = `https://x.com/intent/tweet?url=${u}&text=${t}`;
 }
 
-/* =================================================== */
-/* ★★★ 右クリック禁止設定 (モーダルなし版) ★★★ */
-/* =================================================== */
+// 右クリック（コンテキストメニュー）を無効化する（従来のサイトと同じ挙動）
 function setupRightClickModal() {
-  // コンテキストメニュー（右クリックメニュー）の表示をブロック
   document.addEventListener('contextmenu', e => {
     e.preventDefault();
   }, { passive: false });
@@ -1748,10 +3105,34 @@ function updateHeaderOffset() {
   const sticky = document.querySelector('.sticky-search-area');
   if (!sticky) return;
   const h = sticky.offsetHeight;
+  // 見えていないとき（編集ツールのプレビューが別のタブの裏で描き直されたときなど）は高さが 0 になる。
+  // その値を使うとカードがヘッダーの下に潜り込むので、使わずに見えるようになるのを待つ（下の ResizeObserver が測り直す）
+  if (h === 0) return;
+  // ★iOS対策: PWAの起動・復帰の一瞬、env(safe-area-inset-top)が異常値（0や過大値）を
+  // 返すことがあり、そのタイミングで計測すると誤った余白が残り続けて
+  // 「コンテンツがヘッダーに食い込む」「ヘッダー下に大きな空白ができる」原因になっていた。
+  // 明らかに異常な値（画面の45%超）はその場では採用せず、少し後に再計測する。
+  const cap = Math.max(240, window.innerHeight * 0.45);
+  if (h > cap) {
+    clearTimeout(updateHeaderOffset._retry);
+    updateHeaderOffset._retry = setTimeout(updateHeaderOffset, 250);
+    return; // 直前の正常値を維持したまま再計測を待つ
+  }
   root.style.setProperty('--header-height', h + 'px');
   root.style.setProperty('--header-offset', (h + 10) + 'px');
 }
 window.__updateHeaderOffset = updateHeaderOffset;
+
+// ★iOS対策: セーフエリア値が起動直後・バックグラウンド復帰直後に遅れて確定するため、
+// その前後で複数回計測し直して正しい値に収束させる（計測は軽量なので負荷は無視できる）。
+function settleHeaderOffset() {
+  updateHeaderOffset();
+  [300, 1000, 2500].forEach(ms => setTimeout(updateHeaderOffset, ms));
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') settleHeaderOffset();
+});
+window.addEventListener('pageshow', settleHeaderOffset);
 
 function parseKeywordTime(kw) {
   if (typeof kw !== "string") return null;
@@ -1766,31 +3147,74 @@ function parseKeywordTime(kw) {
   return { base, label, seconds };
 }
 
-function findHitTime(item, rawQuery) {
-  if (!rawQuery) return null;
-  const qn = normalize(rawQuery);
-  if (!qn) return null;
-  for (const kw of (item.keywords || [])) {
-    const p = parseKeywordTime(kw);
-    if (!p) continue;
-    const baseN = normalize(p.base);
-    if (baseN.includes(qn) || qn.includes(baseN)) {
-      return p;
-    }
+// メモの正規化はキー入力のたびに全件で走るため、結果をエントリごとにキャッシュする。
+// WeakMapなので保存・再読込でエントリが作り直されると自動的に破棄され、古い結果は残らない。
+const tsNormCache = new WeakMap();
+function tsNormLabel(e) {
+  let v = tsNormCache.get(e);
+  if (v === undefined) {
+    v = normalize(e.label || '');
+    tsNormCache.set(e, v);
+  }
+  return v;
+}
+
+// ユーザー登録タイムスタンプのメモが検索語のいずれかに部分一致するか
+function matchesUserMemo(item, words) {
+  const entries = getTimestamps(item.favId);
+  if (!entries.length) return false;
+  return entries.some(e => {
+    const ln = tsNormLabel(e);
+    return ln && words.some(w => ln.includes(w));
+  });
+}
+
+// 検索語そのものではなく、登録した読み・別名で当たったキーワードの時刻を返す（無ければ null）。
+// パーソナリティ本人の検索は全回を出すだけなので、時刻は付けない
+function findAliasHitTime(item, rawQuery) {
+  const qn = normalize(rawQuery || '');
+  if (!qn || ALL_EPISODES_TERMS.has(qn) || !item.kwTimes || !item.kwTimes.length) return null;
+  for (const t of expandSearchTerms(qn)) {
+    if (t === qn) continue;
+    const p = item.kwTimes.find(k => k.baseN.includes(t));
+    if (p) return p;
+  }
+  // 読みから当たった表記がコーナーの中身にあれば、そのコーナーの時刻
+  for (const t of expandSearchTerms(qn, true)) {
+    if (t === qn) continue;
+    const c = (item.cornerTexts || []).find(c => c.norm.includes(t));
+    const p = c && item.kwTimes.find(k => k.baseN === c.cornerN);
+    if (p) return p;
   }
   return null;
 }
 
-function withTimeParam(url, seconds) {
-  if (!seconds && seconds !== 0) return url;
-  try {
-    const u = new URL(url);
-    u.searchParams.set("t", String(seconds));
-    return u.toString();
-  } catch {
-    const cleaned = url.replace(/([?&])t=\d+s?(?=&|$)/, "$1").replace(/[?&]$/, "");
-    return cleaned + (cleaned.includes("?") ? "&" : "?") + "t=" + seconds;
+function findHitTime(item, rawQuery) {
+  if (!rawQuery) return null;
+  const qn = normalize(rawQuery);
+  if (!qn) return null;
+  // ★性能: キーワードの時刻解析と正規化は起動時計算済みの kwTimes を使う（結果は同一）
+  for (const p of (item.kwTimes || [])) {
+    if (p.baseN.includes(qn) || qn.includes(p.baseN)) {
+      return p;
+    }
   }
+  // コーナーの中身（フォトメモリーの話題・どこから？の作品名）に一致したら、
+  // そのコーナーが始まる時刻（キーワードの「フォトメモリー@18:08」など）を出す
+  for (const c of (item.cornerTexts || [])) {
+    if (!c.norm.includes(qn)) continue;
+    const p = (item.kwTimes || []).find(k => k.baseN === c.cornerN);
+    if (p) return p;
+  }
+  // ユーザー登録タイムスタンプのメモにも一致すれば、その場面の時間をカードに表示する
+  for (const e of getTimestamps(item.favId)) {
+    if (e.t == null) continue; // 時間なしメモは表示する時間がないため対象外
+    const ln = tsNormLabel(e);
+    if (ln && (ln.includes(qn) || qn.includes(ln))) {
+      return { base: e.label, label: formatTs(e.t), seconds: e.t };
+    }
+  }
+  return null;
 }
 
 function buildTimeline(data) {
@@ -1820,7 +3244,14 @@ function buildTimeline(data) {
       } else if (dateParts.length === 2) {
         dateText = `${String(parseInt(dateParts[1], 10)).padStart(2, '0')}月`;
       }
+      
       const formattedLabel = it.label.replace(/([A-Za-z0-9]+)/g, '<span class="impact-number">$1</span>');
+
+      // リンクがある出来事は、リンクの当たり判定をカード全面に広げる（ストレッチリンク）。
+      // 本物の<a>のままなので、ホバーでブラウザ左下にURLが表示され、
+      // 中クリック/右クリックメニュー/キーボード操作もネイティブに動く。
+      if (it.url) el.classList.add('has-link');
+
       el.innerHTML = `
         ${dateText ? `<div class="date"><span class="impact-number">${dateText}</span></div>` : ''}
         <div class="label">${it.url ? `<a href="${it.url}" target="_blank" rel="noopener">${formattedLabel}</a>` : formattedLabel}</div>
@@ -1831,8 +3262,7 @@ function buildTimeline(data) {
     list.appendChild(fragment);
 }
 
-
-
+// Global function for "Did You Mean"
 window.applyDidYouMean = function(word) {
   const searchBox = document.getElementById('searchBox');
   if (searchBox) {
@@ -1858,7 +3288,8 @@ window.applyDidYouMean = function(word) {
             return startSize;
         },
         fitAll: function() {
-            if (window.innerWidth > 991) {
+            // ★修正: 判定値を 991 から 1069 に変更
+            if (window.innerWidth > 1069) {
                 this.targets.forEach(el => el.style.fontSize = '');
                 return;
             }
@@ -1871,22 +3302,126 @@ window.applyDidYouMean = function(word) {
     document.addEventListener('DOMContentLoaded', () => {
         sizerModule.init();
         document.getElementById('filterToggleBtn')?.setAttribute('data-label', 'フィルタ');
-        setTimeout(() => {
-            const loadingScreen = document.getElementById("loading-screen");
-            if (loadingScreen) {
+
+        const loadingScreen = document.getElementById("loading-screen");
+        if (loadingScreen) {
+            let hidden = false;
+            const hideLoadingScreen = () => {
+                if (hidden) return;
+                hidden = true;
+                // ★下部ナビの表示解禁（起動中はCSSでvisibility:hiddenにしている）。
+                // フェード開始と同時に解禁すれば、他のUIと一緒に自然に現れる。
+                document.body.classList.add('app-ready');
+                // ★修正: iOSはリロードや再起動時にスクロール位置を「遅れて」復元することが
+                // あり（数百ms〜1秒後）、起動直後なのにページが途中までスクロールされた
+                // 状態になることがあった。単発のリセットでは取りこぼすため、スプラッシュ
+                // 解除後2秒間は監視し、ユーザーが操作していないのに位置がずれたら即座に
+                // 先頭へ戻す。ユーザーが触れたら監視を止めて操作を尊重する。
+                const instantTop = () => {
+                    const html = document.documentElement;
+                    const prev = html.style.scrollBehavior;
+                    html.style.scrollBehavior = 'auto';
+                    try { window.scrollTo(0, 0); } catch (e) {}
+                    html.style.scrollBehavior = prev;
+                };
+                instantTop();
+                let watchdogTimer = 0;
+                const stopWatch = () => {
+                    clearInterval(watchdogTimer);
+                    window.removeEventListener('touchstart', stopWatch);
+                    window.removeEventListener('wheel', stopWatch);
+                    window.removeEventListener('keydown', stopWatch);
+                };
+                window.addEventListener('touchstart', stopWatch, { passive: true });
+                window.addEventListener('wheel', stopWatch, { passive: true });
+                window.addEventListener('keydown', stopWatch);
+                watchdogTimer = setInterval(() => {
+                    if (window.scrollY !== 0) instantTop();
+                    // 起動直後はセーフエリア値の確定が遅れることがあるため、ヘッダー余白も監視して追従させる
+                    if (window.__updateHeaderOffset) window.__updateHeaderOffset();
+                }, 100);
+                setTimeout(stopWatch, 2000);
+                // ★ホーム画面アプリ: 「画面の高さ − 表示領域の高さ」（ステータスバーが default のとき上に空く分）を
+                // 実測して覚えておく。次回起動時に index.html がこれを使い、ローディング画面を画面の真ん中に置く。
+                // 起動直後は表示領域の高さが確定していないことがあるため、少し待ってから測り、
+                // すぐアプリを閉じられても記録が残るよう早めにも測る（0 = 上に空きなし、も記録する）
+                const measureTopGap = () => {
+                    try {
+                        if (navigator.standalone !== true || navigator.maxTouchPoints <= 1) return;
+                        if (window.matchMedia('(orientation: landscape)').matches) return;
+                        const ae = document.activeElement;
+                        if (ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return; // キーボード表示中は測らない
+                        const scrH = Math.max(screen.width, screen.height);
+                        const gap = Math.round(scrH - window.innerHeight);
+                        if (window.innerHeight > 0 && gap >= 0 && gap <= 120) localStorage.setItem('pwa_top_gap_v1', String(gap));
+                    } catch (e) {}
+                };
+                setTimeout(measureTopGap, 300);
+                setTimeout(measureTopGap, 2000);
                 loadingScreen.classList.add("fadeout");
                 loadingScreen.addEventListener('transitionend', () => loadingScreen.remove(), { once: true });
-            }
-        }, 1000);
+                setTimeout(() => loadingScreen.remove(), 700); // フェード(0.45s)完了後に確実に除去する保険
+            };
+
+            // エラーメッセージ(.no-results)が出た場合も「描画完了」とみなし、
+            // データ読込失敗時にローディング画面が9秒間残り続けるのを防ぐ
+            const cardsReady = () => !!document.querySelector('#results .fav-btn, #results .episode-item, #results .no-results');
+
+            // フォントの全文字読み込み完了フラグ（__fontsReady はデータ読込後に生成される）
+            let fontsDone = false;
+            const hookFonts = () => {
+                if (window.__fontsReady) { window.__fontsReady.then(() => { fontsDone = true; }); return true; }
+                return false;
+            };
+            hookFonts();
+
+            // ★起動時ちらつき対策: SWの更新チェック決着（index.html側で生成）も待つ。
+            // 更新がある場合はローディング画面の下でリロードが行われ、UIが一瞬
+            // 見えてから再読込される「ちらつき」が起きない。Promise自体に4秒の
+            // 上限があるためオフラインでも起動は止まらない（下のSW_CAPは二重の保険）。
+            let swDone = !window.__swUpdateSettled;
+            if (window.__swUpdateSettled) window.__swUpdateSettled.then(() => { swDone = true; });
+
+            // タイトル画面は「ほどよい表示時間(MIN_SHOW)」「データ(カード)描画完了」
+            // 「フォントの全文字読み込み完了」を満たしたら消す。フォントまで待つことで、
+            // どの文字も最初からAdobeフォントで表示され、一瞬だけフォールバックになるFOUTを防ぐ。
+            // 低速回線で永遠に待たないよう FONT_CAP を上限にする。
+            const MIN_SHOW = 1500;   // タイトル最低表示時間
+            const FONT_CAP = 8000;   // フォントを待つ上限（超えたら諦めて表示）
+            const SW_CAP = 4500;     // SW更新チェックを待つ上限（Promise側の4秒上限の保険）
+            // 確認用サーバー（admin/serve.py）がファイルの変更で自動的に読み直したときは、タイトル画面が
+            // 出ていない（admin/live.js が html に live-reloaded を付けて隠す。公開したサイトでは付かない）ので、
+            // カードが並んだらすぐに使える状態にする（フォント・SWの決着を待つ間、下部ナビが消えたままにならないように）
+            const LIVE_RELOADED = document.documentElement.classList.contains('live-reloaded');
+            const tryHide = () => {
+                // 最低表示時間は「ローディング画面が実際に画面へ出た時刻」から数える（index.html で記録）
+                const t = performance.now();
+                const shown = t - (window.__loadingShownAt || 0);
+                if (!fontsDone) hookFonts();
+                if (cardsReady() && (LIVE_RELOADED || (shown >= MIN_SHOW && (fontsDone || t >= FONT_CAP) && (swDone || t >= SW_CAP)))) { hideLoadingScreen(); return; }
+                requestAnimationFrame(tryHide);
+            };
+            tryHide();
+
+            // 最終保険（データ取得やフォントが失敗しても必ず消す）
+            setTimeout(hideLoadingScreen, 9000);
+        }
     });
 
+    // load（画像全読み込み）を待たずに、DOM構築後すぐに調整を開始する
     const activateButtons = () => {
         const runFit = () => sizerModule.fitAll();
+        
+        // 念のため数回リトライしてサイズを合わせる
         runFit();
         setTimeout(runFit, 100);
         setTimeout(runFit, 300);
+        
+        // ボタンを表示状態にするクラスを付与
+        // 少しだけ待つのは、フォント読み込みによるガタつきを一瞬隠すため
         setTimeout(() => {
             document.body.classList.add('buttons-ready');
+            // 表示後にもう一度だけ念押しの調整
             setTimeout(runFit, 200); 
         }, 100); 
     };
@@ -1897,13 +3432,14 @@ window.applyDidYouMean = function(word) {
         activateButtons();
     }
     
+    // 念のため window.load でも再調整だけ走らせる（表示はすでにされている）
     window.addEventListener('load', () => {
         sizerModule.fitAll();
     });
 })();
 
 (function robustScrollUnlock() {
-    const modalIds = ['filterDrawer', 'aboutModal', 'historyModal'];
+    const modalIds = ['filterDrawer', 'aboutModal', 'historyModal', 'photoModal', 'tsModal'];
     const observerCallback = (mutationsList) => {
         for (const mutation of mutationsList) {
             const targetElement = mutation.target;
@@ -1933,28 +3469,69 @@ function initializeAutocomplete() {
   if (!inputEl || !boxEl) return;
 
   const hasKanji = (s) => /[\u4e00-\u9faf\u3400-\u4dbf]/.test(s || '');
-  const entriesByLabel = new Map();
 
+  // ★かな折りたたみ（候補マッチング専用）: 小書き文字を並字に、長音を除去して比較する。
+  // 「けつそくばんど」(っ→つ の打ち間違い) や「うぃーうぃるびー」(長音の揺れ) でも
+  // 候補が出るようにするための吸収形。検索本体の一致判定には使わない。
+  const SMALL_KANA = { 'っ':'つ','ゃ':'や','ゅ':'ゆ','ょ':'よ','ぁ':'あ','ぃ':'い','ぅ':'う','ぇ':'え','ぉ':'お','ゎ':'わ' };
+  const foldKana = (s) => s.replace(/[っゃゅょぁぃぅぇぉゎ]/g, ch => SMALL_KANA[ch]).replace(/ー/g, '');
+
+  // 候補の一覧はデータから作る。データを読み直したら（編集ツールのプレビューで文字を直したとき等）作り直す
+  const buildEntries = () => {
+  const entriesByLabel = new Map();
   const ensureEntry = (label, type) => {
     if (!label) return;
     const baseLabel = stripTimeSuffix(label);
     let entry = entriesByLabel.get(baseLabel);
     if (!entry) {
-      entry = { label: baseLabel, type: type || 'キーワード', norms: new Set() };
+      entry = { label: baseLabel, type: type || 'キーワード', norms: new Set(), relatedNorms: new Set() };
       entriesByLabel.set(baseLabel, entry);
     }
-    entry.norms.add(normalize(baseLabel));
+    const addNorm = (s) => {
+      const n = normalize(s);
+      entry.norms.add(n);
+      const f = foldKana(n);
+      if (f !== n) entry.norms.add(f);
+    };
+    addNorm(baseLabel);
     if (CUSTOM_READINGS[baseLabel]) {
-      CUSTOM_READINGS[baseLabel].forEach(r => entry.norms.add(normalize(r)));
+      CUSTOM_READINGS[baseLabel].forEach(addNorm);
     }
   };
 
   data.forEach(ep => {
     (ep.keywords || []).forEach(kw => ensureEntry(kw, 'キーワード'));
-    (Array.isArray(ep.guest) ? ep.guest : [ep.guest]).filter(Boolean).forEach(g => ensureEntry(g, '出演者'));
+    ep.worksList.forEach(w => ensureEntry(w, 'キーワード'));
+    // コーナーの中身（フォトメモリーの話題・どこから？の作品名）も候補に出す
+    (ep.cornerTexts || []).forEach(c => cornerTextItems(c.text).forEach(w => ensureEntry(w, 'コーナー')));
   });
+  // 人物名（readings.json の登録人物）は人アイコンの候補として出す
+  PERSON_LIST.forEach(name => ensureEntry(name, '出演者'));
 
-  const entries = Array.from(entriesByLabel.values());
+  // ==========================================
+  // 関連ワード（related.json）の紐付け
+  // 「LIVE STAGE「ぼっち・ざ・ろっく！」→ 守乃まも・大竹美希…」なら、LIVE STAGE の表記・読み（ぶたいぼっち 等）を
+  // 打ったときに、守乃まもなども候補に出す。候補に出すのは、データの中にある語だけ
+  // ==========================================
+  for (const [key, words] of Object.entries(RELATED_WORDS)) {
+    if (!Array.isArray(words)) continue;
+    const keyNorms = new Set();
+    const addKeyNorm = (s) => { const n = normalize(s); if (!n) return; keyNorms.add(n); const f = foldKana(n); if (f !== n) keyNorms.add(f); };
+    addKeyNorm(key);
+    (CUSTOM_READINGS[key] || []).forEach(addKeyNorm);
+    words.forEach(w => {
+      const kwEntry = entriesByLabel.get(String(w || '').trim());
+      if (!kwEntry) return;
+      // 関連する語の読み（あおやまよしの・ぶたいぼっち等）は「関連」として別枠に持たせる。
+      // 自分の読みと同列に扱うと、「よぴ」で熊本・幼稚園などが「よぴさゆ」より上に並んでしまう
+      keyNorms.forEach(norm => { if (!kwEntry.norms.has(norm)) kwEntry.relatedNorms.add(norm); });
+    });
+  }
+
+  return Array.from(entriesByLabel.values());
+  };
+  let entries = buildEntries();
+  rebuildAutocompleteEntries = () => { entries = buildEntries(); };
   let cursor = -1;
   let viewItems = [];
 
@@ -1964,30 +3541,37 @@ function initializeAutocomplete() {
   const render = (items) => {
     if (isSearchTriggered) return;
     viewItems = items;
+    cursor = -1;
     boxEl.innerHTML = '';
-    boxEl.hidden = items.length === 0;
-    const qRaw = inputEl.value.trim().toLowerCase();
+    
+    // ★修正: 先にDOMを追加してから表示を切り替える
     const fragment = document.createDocumentFragment();
     items.forEach((item, idx) => {
       const el = document.createElement('div');
       el.className = 'autocomplete-item';
       el.setAttribute('role', 'option');
       el.setAttribute('aria-selected', idx === cursor);
-      const i = item.label.toLowerCase().indexOf(qRaw);
-      const html = (i >= 0)
-        ? `${item.label.slice(0, i)}<span class="match">${item.label.slice(i, i + qRaw.length)}</span>${item.label.slice(i + qRaw.length)}`
-        : item.label;
-      const icon = item.type === '出演者' ? '<i class="fa-solid fa-user"></i>' : '<i class="fa-solid fa-magnifying-glass"></i>';
-      el.innerHTML = `<span class="type">${icon}</span><span class="label">${html}</span>`;
+      const icon = item.type === '出演者' ? '<i class="fa-solid fa-user"></i>'
+        : item.type === 'メモ' ? '<i class="fa-solid fa-star memo-star"></i>'
+        : item.type === 'エピソード' ? '<i class="fa-solid fa-hashtag"></i>'
+        : '<i class="fa-solid fa-magnifying-glass"></i>';
+      // 候補ラベルにはユーザー登録メモ（自由入力）も含まれるため、必ずエスケープして挿入する
+      el.innerHTML = `<span class="type">${icon}</span><span class="label">${escapeHtml(item.label)}</span>`;
       el.addEventListener('mousedown', (e) => { e.preventDefault(); pick(idx); });
       fragment.appendChild(el);
     });
     boxEl.appendChild(fragment);
+
+    // ★追加: 中身を入れた後に表示状態を切り替え、フォント計算を強制
+    boxEl.hidden = items.length === 0;
+    if (!boxEl.hidden) {
+        void boxEl.offsetHeight; // 強制リフロー
+    }
   };
 
  const pick = (index) => {
         if (!viewItems[index]) return;
-        inputEl.value = viewItems[index].label;
+        inputEl.value = viewItems[index].value || viewItems[index].label;
         clear();
         setTimeout(() => {
           search();
@@ -1998,42 +3582,176 @@ function initializeAutocomplete() {
         }, 0);
       };
 
-  const scoreEntry = (entry, normQ, raw) => {
-    let prefix = false, part = false;
+  // ★Google風スコアリング:
+  // 完全一致(1000) > 前方一致(800) > 部分一致(600) > 曖昧一致(400台) の階層で採点し、
+  // 曖昧一致は編集距離（打ち間違い・文字の入れ替え・抜けを許容）で判定する。
+  // 距離の許容量は入力の長さに応じて自動調整（2文字→1、4文字→2、6文字以上→3）。
+  // 長いラベルには「先頭だけとの距離」も見て、入力途中のタイプミスでも候補が出るようにする。
+  const scoreEntry = (entry, queries, raw) => {
+    let best = null;
     for (const k of entry.norms) {
-      if (k.startsWith(normQ)) { prefix = true; break; }
-      if (!part && k.includes(normQ)) part = true;
+      for (const q of queries) {
+        const qLen = q.length;
+        const maxDist = qLen >= 6 ? 3 : qLen >= 4 ? 2 : qLen >= 2 ? 1 : 0;
+        let s = null;
+        if (k === q) s = 1000;
+        else if (k.startsWith(q)) s = 800;
+        else if (k.includes(q)) s = 600;
+        else if (maxDist > 0) {
+          // 長さが違いすぎるものは距離計算せず除外（性能と精度の両方のため）
+          if (Math.abs(k.length - qLen) <= maxDist || k.length > qLen) {
+            let d = damerauLevenshtein(q, k);
+            // 前方窓との距離: 「ラベルの先頭部分にタイプミス込みで一致」を拾う
+            if (k.length > qLen + 1) {
+              const dHead = damerauLevenshtein(q, k.slice(0, qLen + 1));
+              if (dHead < d) d = dHead;
+            }
+            if (d <= maxDist) s = 400 - d * 60;
+          }
+        }
+        if (s !== null && (best === null || s > best)) best = s;
+      }
     }
-    if (!prefix && !part) return null;
-    return (prefix ? 4 : 0) + (part ? 1 : 0) + (!hasKanji(raw) && hasKanji(entry.label) ? 2 : 0) + (entry.type === '出演者' ? 1 : 0);
+    // 関連ワード（related.json）での一致: 打った語が関連元の語・読みと同じか、その頭なら 500
+    // （打ち間違いを許す曖昧一致(220〜400)より上、本人の部分一致(600)より下）。途中に含むだけなら 200
+    if (entry.relatedNorms && entry.relatedNorms.size && (best === null || best < 500)) {
+      let rel = null;
+      for (const k of entry.relatedNorms) {
+        for (const q of queries) {
+          if (k === q || k.startsWith(q)) { rel = 500; break; }
+          if (rel === null && k.includes(q)) rel = 200;
+        }
+        if (rel === 500) break;
+      }
+      if (rel !== null && (best === null || rel > best)) best = rel;
+    }
+    if (best === null) return null;
+    return best + (!hasKanji(raw) && hasKanji(entry.label) ? 2 : 0) + (entry.type === '出演者' ? 1 : 0);
+  };
+
+  // 候補ラベルへの変換（かな読みは漢字表記に直す）。onInputの通常経路とフォールバックで共用
+  const toItem = (e) => {
+    let label = e.label;
+    const nlabel = normalize(label);
+    if (!hasKanji(label) && READING_TO_LABEL[nlabel]) label = READING_TO_LABEL[nlabel];
+    return { label, type: e.type };
   };
 
 const onInput = () => {
     const raw = inputEl.value;
     const normQ = normalize(raw);
     if (!normQ) { clear(); return; }
-    const scored = entries.map(e => ({ e, s: scoreEntry(e, normQ, raw) })).filter(item => item.s !== null);
-    scored.sort((a, b) => b.s - a.s);
-    const seen = new Set();
-    const items = scored.slice(0, 20).map(({ e }) => {
-      let label = e.label;
-      const nlabel = normalize(label);
-      if (!hasKanji(label) && READING_TO_LABEL[nlabel]) {
-        label = READING_TO_LABEL[nlabel];
+    
+    // 「12」「#12」「第12回」でその回のキーワード一覧を候補に出す（全角数字も可）
+    const episodeQuery = raw.normalize('NFKC').trim().replace(/^#\s*/, '').replace(/^第\s*(\d+)\s*回?$/, '$1');
+
+    if (/^\d+$/.test(episodeQuery)) {
+      const episodeNumber = parseInt(episodeQuery, 10);
+      const targetEpisode = data.find(ep => /^\d+$/.test(ep.episode) && parseInt(ep.episode, 10) === episodeNumber);
+
+      if (targetEpisode) {
+        const epTag = `第${episodeNumber}回`;
+        // パーソナリティ本人の名前・愛称は全回に出てくるので候補から外す
+        const guestKeywordsToExclude = new Set([PERSONALITY, ...(CUSTOM_READINGS[PERSONALITY] || [])]);
+
+        const filteredKeywords = (targetEpisode.keywords || []).filter(kw => {
+          const cleanKeyword = stripTimeSuffix(kw).trim();
+          return cleanKeyword && !guestKeywordsToExclude.has(cleanKeyword);
+        });
+
+        // 選んだら「第43回 キーワード」で検索＝その回だけに絞り、キーワードの時刻付きリンクになる
+        const keywordsAsEntries = filteredKeywords.map(kw => ({
+          label: stripTimeSuffix(kw),
+          value: `${epTag} ${stripTimeSuffix(kw)}`,
+          type: `第${targetEpisode.episode}回`
+        }));
+        
+        const seen = new Set();
+        const uniqueEntries = keywordsAsEntries.filter(el => {
+            const duplicate = seen.has(el.label);
+            seen.add(el.label);
+            return !duplicate;
+        });
+
+        // 先頭にその回そのもの（「第43回」）を置く
+        render([{ label: epTag, value: epTag, type: 'エピソード' }, ...uniqueEntries]);
+        return;
       }
-      if (seen.has(label)) return null;
-      seen.add(label);
-      return { label: label, type: e.type };
+    }
+
+    // 通常形とかな折りたたみ形（けつ→けっ…等の揺れ吸収）の両方で採点する
+    const foldQ = foldKana(normQ);
+    const queries = foldQ === normQ ? [normQ] : [normQ, foldQ];
+    const scored = entries.map(e => ({ e, s: scoreEntry(e, queries, raw) })).filter(item => item.s !== null);
+    // 同スコアはラベルが短いもの優先（Googleと同じく簡潔な候補が上に来る）
+    scored.sort((a, b) => b.s - a.s || a.e.label.length - b.e.label.length);
+
+    const seen = new Set();
+    const items = scored.slice(0, 100).map(({ e }) => {
+      const item = toItem(e);
+      if (seen.has(item.label)) return null;
+      seen.add(item.label);
+      return item;
     }).filter(Boolean);
-    render(items.slice(0, 12));
+
+    // ユーザー登録タイムスタンプのメモも候補に出す（部分一致・★マークで区別）。
+    // 登録内容は随時変わるため、固定のentriesではなく毎回その場で探す。
+    const memoItems = [];
+    const seenMemo = new Set();
+    for (const id in timestamps) {
+      for (const e of (timestamps[id] || [])) {
+        const label = (e.label || '').trim();
+        if (!label || seenMemo.has(label)) continue;
+        const nl = tsNormLabel(e);
+        if (!nl.includes(normQ) && !foldKana(nl).includes(foldQ)) continue;
+        seenMemo.add(label);
+        memoItems.push({ label, type: 'メモ' });
+        if (memoItems.length >= 20) break;
+      }
+      if (memoItems.length >= 20) break;
+    }
+
+    // 自分のメモを先頭に表示し、同名のサイト側キーワードは重複させない
+    let merged = [...memoItems, ...items.filter(i => !seenMemo.has(i.label))];
+
+    // ★何を入力しても候補を出す（Googleの「常に何か提案する」挙動）:
+    // 通常の採点で1件も掛からなかった時は、全エントリを「距離÷長さ」の近さで
+    // 並べ、最も近いものから少数だけ出す。まったく無関係な入力（近さ0.6超）まで
+    // は出さないことで、「それっぽいものだけが出る」自然な塩梅にしている。
+    if (merged.length === 0) {
+      const near = [];
+      for (const e of entries) {
+        let bestR = Infinity;
+        for (const k of e.norms) {
+          for (const q of queries) {
+            const d = damerauLevenshtein(q, k);
+            const r = d / Math.max(q.length, k.length);
+            if (r < bestR) bestR = r;
+          }
+        }
+        if (bestR <= 0.6) near.push({ e, r: bestR });
+      }
+      near.sort((a, b) => a.r - b.r || a.e.label.length - b.e.label.length);
+      const seenNear = new Set();
+      merged = near.slice(0, 12).map(({ e }) => toItem(e)).filter(i => {
+        if (seenNear.has(i.label)) return false;
+        seenNear.add(i.label);
+        return true;
+      }).slice(0, 6);
+    }
+
+    render(merged.slice(0, 100));
   };
+  
   const debouncedOnInput = debounce(onInput, 150);
+
   const onKeyDown = (e) => {
     if (e.key === 'Enter') {
       if (e.isComposing) {
         return;
       }
       e.preventDefault();
+      
       if (!boxEl.hidden && cursor >= 0) {
         pick(cursor);
       } else {
@@ -2044,16 +3762,64 @@ const onInput = () => {
       }
       return;
     }
+
     if (boxEl.hidden) return;
-    if (e.key === 'ArrowDown') { e.preventDefault(); cursor = (cursor + 1) % viewItems.length; render(viewItems); } 
-    else if (e.key === 'ArrowUp') { e.preventDefault(); cursor = (cursor - 1 + viewItems.length) % viewItems.length; render(viewItems); } 
+    // 矢印キーでは作り直さず選択表示だけ切り替え、選択中の候補が見える位置までリストをスクロールする
+    // （作り直すとスクロール位置が先頭に戻り、7件目以降の選択が見えなくなっていた）
+    const moveCursor = (next) => {
+      cursor = next;
+      const rows = boxEl.children;
+      for (let i = 0; i < rows.length; i++) rows[i].setAttribute('aria-selected', String(i === cursor));
+      const sel = rows[cursor];
+      if (!sel) return;
+      const top = sel.offsetTop, bottom = top + sel.offsetHeight;
+      if (top < boxEl.scrollTop) boxEl.scrollTop = top;
+      else if (bottom > boxEl.scrollTop + boxEl.clientHeight) boxEl.scrollTop = bottom - boxEl.clientHeight;
+    };
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveCursor((cursor + 1) % viewItems.length); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveCursor((cursor - 1 + viewItems.length) % viewItems.length); }
     else if (e.key === 'Escape') { clear(); }
   };
+
   inputEl.addEventListener('input', debouncedOnInput); 
   inputEl.addEventListener('keydown', onKeyDown);
   document.addEventListener('click', (e) => {
     if (e.target !== inputEl && !boxEl.contains(e.target)) clear();
   });
+  // ★キーボードを閉じたら候補も閉じる: フォーカスが外れたタイミングで候補を消す。
+  // 候補のタップは mousedown（blurより先に発火）+ preventDefault で処理されるため、
+  // 少しの遅延を挟めば選択操作を妨げない。
+  // ただし候補リストを触っている最中（スクロール等）にiOSがキーボードを閉じても、
+  // リストは消さずに閲覧を続けられるようにする（選択・外側タップで閉じる）。
+  let acListTouching = false;
+  boxEl.addEventListener('touchstart', () => { acListTouching = true; }, { passive: true });
+  boxEl.addEventListener('touchend', () => { setTimeout(() => { acListTouching = false; }, 300); }, { passive: true });
+  inputEl.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (!acListTouching) {
+        // 保留中の入力デバウンス(150ms)をキャンセルしないと、
+        // 「1文字入力→すぐキーボードを閉じる」の時にclear後へonInputが発火して候補が再表示される
+        debouncedOnInput.cancel();
+        clear();
+      }
+    }, 120);
+  });
+  // ★iOSはキーボード右下の「閉じる」ボタンではblurが発火しない（フォーカスは残る）。
+  // キーボードが閉じるとビジュアルビューポートの高さが大きく戻るので、それを検知して候補を閉じる。
+  // （URLバーの伸縮は最大100px程度・キーボードは250px以上のため、しきい値120pxで誤動作しない）
+  if (window.visualViewport && navigator.maxTouchPoints > 0) {
+    let vvMinH = window.visualViewport.height;
+    window.visualViewport.addEventListener('resize', () => {
+      const h = window.visualViewport.height;
+      if (boxEl.hidden) { vvMinH = h; return; }
+      vvMinH = Math.min(vvMinH, h);
+      if (h - vvMinH > 120 && !acListTouching) {
+        debouncedOnInput.cancel();
+        clear();
+        vvMinH = h;
+      }
+    });
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -2064,14 +3830,138 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('load', updateHeaderOffset);
   window.addEventListener('resize', () => setTimeout(updateHeaderOffset, 50));
   new MutationObserver(updateHeaderOffset).observe(document.querySelector('.sticky-search-area'), { childList: true, subtree: true, attributes: true });
+  // ヘッダーの高さが変わったら測り直す（隠れていた画面が見えるようになったときも。resize が来ない場合がある）
+  if (window.ResizeObserver) new ResizeObserver(() => updateHeaderOffset()).observe(document.querySelector('.sticky-search-area'));
 });
+
+/* ===================================================
+ * スプラッシュカバー（起動画面と同じ見た目の全面オーバーレイ）
+ * 用途1: PWAがバックグラウンドへ移る瞬間に被せる。iOSはその瞬間の画面を
+ *   スナップショットとして保存し次回起動時に一瞬表示するため、これを
+ *   起動画面と同じ見た目にしておくと「前回のUI（下部ボタン等）が
+ *   一瞬ちらついて見える」現象がなくなり、起動が常にスプラッシュから始まる。
+ * 用途2: SW更新の自動リロード直前に被せ、リロードの明滅を隠して
+ *   スプラッシュ→スプラッシュの連続に見せる。
+ * =================================================== */
+/* ★強化: iOSはバックグラウンド移行後すぐ描画を停止するため、visibilitychange内で
+   要素生成や画像読込をしていると、スナップショット撮影までにカバーの描画が
+   間に合わないことがある。カバーは起動時に1回だけ組み立ててDOMに置いておき
+   （ロゴも先に読込・デコード済みにする）、表示はstyleの切替1発だけにする。 */
+let __splashCoverEl = null;
+// 端末の物理画面高さ（縦向き基準）。バックグラウンド移行中はビューポート値が
+// 当てにならないため、カバーの寸法・ロゴ位置はこの値を基準にする。
+function __deviceScreenHeight() {
+  const isLandscape = window.matchMedia && window.matchMedia('(orientation: landscape)').matches;
+  const w = (window.screen && screen.width) || window.innerWidth || 0;
+  const h = (window.screen && screen.height) || window.innerHeight || 0;
+  return (isLandscape ? Math.min(w, h) : Math.max(w, h)) || window.innerHeight || 900;
+}
+function __buildSplashCover() {
+  if (__splashCoverEl || !document.body) return;
+  const d = document.createElement('div');
+  d.id = 'splash-cover';
+  const bg = document.documentElement.style.backgroundColor || '#f9fafe';
+  // ★重要: inset:0（ビューポート追従）にすると、バックグラウンド移行中に
+  // ビューポートが縮んだ瞬間のスナップショットで下部にbody背景が露出し、
+  // 次回起動時に「下部が一瞬チラつく」原因になる。画面より大きい固定高さにして
+  // どんなビューポート変動でも隙間ができないようにする（はみ出しは無害）。
+  d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;background:' + bg + ';display:none;';
+  const img = new Image();
+  img.src = 'logo.webp'; // SWキャッシュ済み。起動時に読み込んでおけば表示は即時
+  img.alt = '';
+  // ロゴは「画面の中央」（カバー箱の中央ではなく）に絶対配置する
+  img.style.cssText = 'position:absolute;left:50%;top:0;transform:translate(-50%,-50%);width:420px;max-width:85vw;';
+  d.appendChild(img);
+  document.body.appendChild(d);
+  __splashCoverEl = d;
+}
+window.__showSplashCover = function () {
+  if (!__splashCoverEl) __buildSplashCover();
+  if (!__splashCoverEl) return;
+  const scrH = __deviceScreenHeight();
+  __splashCoverEl.style.height = (scrH + 300) + 'px'; // 画面+300pxで変動を吸収
+  const img = __splashCoverEl.querySelector('img');
+  // ロゴは物理画面の中央＝ローディング画面のロゴ位置と一致させる（このサイトはロゴのみで玉は無い）。
+  // 横向きスマホ（高さ500px以下）はローディング画面と同じく、ロゴを画面の高さに合わせて縮める
+  const isShortLandscape = window.matchMedia && window.matchMedia('(orientation: landscape) and (max-height: 500px)').matches;
+  if (img) {
+    if (isShortLandscape) {
+      const w = Math.min(420, window.innerWidth * 0.6, (scrH - 60) * 16 / 9);
+      img.style.width = Math.round(w) + 'px';
+      img.style.maxWidth = 'none';
+    } else {
+      img.style.width = '420px';
+      img.style.maxWidth = '85vw';
+    }
+    img.style.top = Math.round(scrH / 2) + 'px';
+  }
+  __splashCoverEl.style.display = 'block';
+};
+window.__hideSplashCover = function () {
+  if (__splashCoverEl) __splashCoverEl.style.display = 'none';
+};
 
 (function enhanceMobileExperience() {
   const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
-  if (isStandalone) {
-    document.documentElement.classList.add('is-standalone');
-    document.addEventListener('DOMContentLoaded', setupPwaBottomNav);
+  // ★タッチ端末（iPhone/Android/iPad）のブラウザ表示でもPWA版と同じUI（下部ナビ等）にする。
+  // 判定は「主入力がタッチ(pointer: coarse)」かつ「タッチ点あり」: Macのトラックパッドや
+  // マウス主体のPCは従来のPC版UIのまま。CSSは html.is-standalone をそのまま流用する。
+  // （maxTouchPointsは環境により0を返すことがあるため、主判定は pointer: coarse のみ。
+  //   matchMedia非対応の古い環境だけタッチ点数で代替する）
+  const isTouchDevice = (window.matchMedia && typeof window.matchMedia('(pointer: coarse)').matches === 'boolean')
+    ? window.matchMedia('(pointer: coarse)').matches
+    : (navigator.maxTouchPoints || 0) > 1;
+  // ★PC版でも画面幅が狭い時はPWA版と同じUIにする（境界はPC版のサイドバー切替と同じ1070px）。
+  // 幅の変化に追従して付け外しするため、下部ナビは常に生成しておき、表示はCSS(html.is-standalone)に任せる
+  const MOBILE_UI_MAX_WIDTH = 1069;
+  const narrowMq = window.matchMedia ? window.matchMedia('(max-width: ' + MOBILE_UI_MAX_WIDTH + 'px)') : null;
+  const useMobileUI = () => isStandalone || isTouchDevice || (narrowMq ? narrowMq.matches : window.innerWidth <= MOBILE_UI_MAX_WIDTH);
+  const applyMobileUI = () => {
+    const on = useMobileUI();
+    if (document.documentElement.classList.contains('is-standalone') === on) return;
+    document.documentElement.classList.toggle('is-standalone', on);
+    // 上部ボタン行の有無でヘッダー高さが変わるため、余白計算をやり直す
+    if (window.__updateHeaderOffset) { try { window.__updateHeaderOffset(); } catch (e) {} }
+  };
+  applyMobileUI();
+  document.addEventListener('DOMContentLoaded', () => {
+    setupPwaBottomNav();
+  });
+  if (narrowMq) {
+    (narrowMq.addEventListener ? narrowMq.addEventListener('change', applyMobileUI) : narrowMq.addListener(applyMobileUI));
+  } else {
+    window.addEventListener('resize', applyMobileUI);
   }
+
+  if (isStandalone) {
+    document.addEventListener('DOMContentLoaded', () => {
+      // カバーを事前構築（ロゴの読込・デコードを済ませ、以後の表示をstyle切替1発にする）
+      // ※ホーム画面アプリ専用（起動スナップショット／更新リロードの明滅隠し用）
+      __buildSplashCover();
+    });
+
+    // ★スナップショット戦略の変更:
+    // 以前は「バックグラウンド時にスプラッシュカバーを被せ、OSの保存する画面写真を
+    // 起動画面にする」方式だったが、復帰のたびにOSの復帰アニメーションでロゴが
+    // 一瞬表示されるのが不評だった。方式を変え、バックグラウンド時は
+    // 「下部ナビだけを隠す」ことにする:
+    //  - 復帰時: 写真は実画面とほぼ同じ（ナビ無しのUI）→ ロゴは一切表示されない
+    //  - コールド起動時: 写真にナビが写っていないので、ローディング画面への切替で
+    //    「下部ボタンがちらつく」ことが構造的に起きない（下部は背景色→背景色で滑らか）
+    // スプラッシュカバー自体は、更新時の自動リロード（controllerchange）の
+    // 明滅隠しとして引き続き使う。
+    const hideNavForSnapshot = () => document.documentElement.classList.add('snap-hide-nav');
+    const restoreNavAfterResume = () => document.documentElement.classList.remove('snap-hide-nav');
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') hideNavForSnapshot();
+      else restoreNavAfterResume();
+    });
+    window.addEventListener('pagehide', hideNavForSnapshot);
+    window.addEventListener('pageshow', restoreNavAfterResume);
+    // 保険: 復帰イベントの取りこぼし時も、操作すればナビ・カバーは必ず戻る
+    window.addEventListener('touchstart', () => { restoreNavAfterResume(); window.__hideSplashCover(); }, { passive: true });
+  }
+
   const setVh = () => {
     if (isInputFocused) return;
     document.documentElement.style.setProperty('--vh', `${window.innerHeight * 0.01}px`);
@@ -2079,6 +3969,13 @@ document.addEventListener('DOMContentLoaded', () => {
   setVh();
   window.addEventListener('resize', setVh, { passive: true });
   window.addEventListener('orientationchange', setVh, { passive: true });
+  // ★修正: iOSのPWA起動直後はビューポート確定時にwindowのresizeが発火しないことがあり、
+  // --vhが起動時の小さい値のまま残っていた（お気に入りが少ない時にフッターが浮く原因）。
+  // visualViewportの変化でも再計測して確実に追従させる。
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', setVh, { passive: true });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
     const searchInput = document.getElementById('searchBox');
     if (searchInput) {
@@ -2094,6 +3991,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const bottomNav = document.createElement('nav');
     bottomNav.className = 'pwa-bottom-nav';
     bottomNav.id = 'pwa-bottom-nav';
+
     const buttonConfig = [
       { id: 'filterToggleBtn', label: 'フィルタ', icon: 'fa-solid fa-filter' },
       { id: 'favOnlyToggleBtn', label: 'お気に入り', icon: 'fa-solid fa-star' },
@@ -2101,9 +3999,11 @@ document.addEventListener('DOMContentLoaded', () => {
       { id: 'randomBtn', label: 'ランダム', icon: 'fa-solid fa-shuffle' },
       { id: 'mainResetBtn', label: 'リセット', icon: 'fa-solid fa-rotate-left' }
     ];
+
     buttonConfig.forEach(config => {
       const originalButton = document.getElementById(config.id);
       if (!originalButton) return;
+
       const newButton = document.createElement('button');
       newButton.className = 'pwa-bottom-nav-btn';
       newButton.id = `pwa-${config.id}`;
@@ -2111,10 +4011,12 @@ document.addEventListener('DOMContentLoaded', () => {
         <i class="${config.icon}"></i>
         <span>${config.label}</span>
       `;
+
       newButton.addEventListener('click', (e) => {
         e.stopPropagation();
         originalButton.click();
       });
+
       if (config.id === 'filterToggleBtn' || config.id === 'favOnlyToggleBtn' || config.id === 'mainResetBtn') {
         const observer = new MutationObserver(() => {
           const isPressed = originalButton.getAttribute('aria-pressed') === 'true';
@@ -2122,9 +4024,11 @@ document.addEventListener('DOMContentLoaded', () => {
           newButton.classList.toggle('is-active', isPressed || isExpanded);
         });
         observer.observe(originalButton, { attributes: true, attributeFilter: ['aria-pressed', 'aria-expanded'] });
+        
         const isPressed = originalButton.getAttribute('aria-pressed') === 'true';
         const isExpanded = originalButton.getAttribute('aria-expanded') === 'true';
         newButton.classList.toggle('is-active', isPressed || isExpanded);
+      
       } else if (config.id === 'theme-toggle-btn') {
         const themePanel = document.getElementById('floating-theme-panel');
         if (themePanel) {
@@ -2136,215 +4040,56 @@ document.addEventListener('DOMContentLoaded', () => {
           newButton.classList.toggle('is-active', themePanel.classList.contains('show'));
         }
       }
+
       bottomNav.appendChild(newButton);
     });
+
     if (bottomNav.hasChildNodes()) {
       document.body.appendChild(bottomNav);
     }
   }
 })();
 
-function fitFilterButtonsSync() {
-  const buttons = document.querySelectorAll('.btn-corner, .guest-button, .btn-year, .btn-category');
-  buttons.forEach(btn => {
-    if (btn.clientWidth === 0) return;
-    btn.style.fontSize = ''; 
-    if (btn.scrollWidth > btn.clientWidth) {
-      const style = window.getComputedStyle(btn);
-      const currentSize = parseFloat(style.fontSize);
-      const ratio = (btn.clientWidth - 6) / btn.scrollWidth;
-      let newSize = currentSize * ratio * 0.93;
-      if (newSize < 8) newSize = 8; 
-      btn.style.fontSize = `${Math.floor(newSize * 10) / 10}px`;
-    }
-  });
-}
-
-function preCalculateFilterButtonSizes() {
-  const drawer = document.getElementById('filterDrawer');
-  if (!drawer) return;
-  const originalDisplay = drawer.style.display;
-  const originalVisibility = drawer.style.visibility;
-  const needsTempShow = getComputedStyle(drawer).display === 'none';
-
-  if (needsTempShow) {
-    drawer.style.visibility = 'hidden'; 
-    drawer.style.display = 'block';     
-  }
-  fitFilterButtonsSync();
-  if (needsTempShow) {
-    if (originalDisplay === '') {
-        drawer.style.display = ''; 
-    } else {
-        drawer.style.display = originalDisplay;
-    }
-    drawer.style.visibility = originalVisibility;
-  }
-}
-
-if (document.fonts && document.fonts.ready) {
-    document.fonts.ready.then(() => {
-        preCalculateFilterButtonSizes();
-    });
-}
-let resizeTimer;
-window.addEventListener('resize', () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(preCalculateFilterButtonSizes, 150);
-}, { passive: true });
-
-const filterToggleBtn = document.getElementById('filterToggleBtn');
-if (filterToggleBtn) {
-    filterToggleBtn.addEventListener('click', () => {
-        fitFilterButtonsSync();
-    });
-}
-
-let resizeTimerFilter;
-window.addEventListener('resize', () => {
-  clearTimeout(resizeTimerFilter);
-  resizeTimerFilter = setTimeout(() => {
-    if (document.getElementById('filterDrawer').style.display !== 'none') {
-        fitFilterButtonsSync();
-    }
-  }, 200);
-}, { passive: true });
-
-/* --- フォトリンクモーダル表示関数 (アップグレード版) --- */
-function openPhotoLinksModal(buttonOrData, customTitle = 'フォトメモリンク') {
-  let links = [];
-
-  // ボタンから呼ばれた場合（通常のフォトメモリー）
-  if (buttonOrData instanceof HTMLElement) {
-      const linksDataStr = buttonOrData.getAttribute('data-links');
-      if (!linksDataStr) return;
-      try {
-          links = JSON.parse(linksDataStr.replace(/&quot;/g, '"'));
-      } catch (e) {
-          console.error("JSON parse error:", e);
-          return;
-      }
-  } 
-  // データ配列が直接渡された場合（オンショット）
-  else if (Array.isArray(buttonOrData)) {
-      links = buttonOrData;
-  } else {
-      return;
+// キーボードの左右矢印キーでのページネーション操作
+document.addEventListener('keydown', (e) => {
+  // Alt/⌘/Ctrl/Shift と組み合わせた矢印（ブラウザの「戻る」など）は横取りしない
+  if (e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return;
+  // 検索ボックス等にフォーカスが当たっている場合はスキップ
+  const activeEl = document.activeElement;
+  if (activeEl && ['input', 'textarea', 'select'].includes(activeEl.tagName.toLowerCase())) {
+    return;
   }
 
-  const modal = document.getElementById('photo-links-modal');
-  const listContainer = document.getElementById('photo-links-list');
-  
-  if (!modal || !listContainer) return;
-
-  // タイトルを追加・上書き
-  let titleEl = modal.querySelector('h3');
-  if (!titleEl) {
-      titleEl = document.createElement('h3');
-      const content = modal.querySelector('.photo-links-content');
-      if(content) content.insertBefore(titleEl, listContainer);
+  // フィルタードロワーやモーダルが開いている場合はスキップ
+  const filterDrawer = document.getElementById('filterDrawer');
+  const historyModal = document.getElementById('historyModal');
+  const aboutModal = document.getElementById('aboutModal');
+  const photoModal = document.getElementById('photoModal');
+  const tsModal = document.getElementById('tsModal'); // ★追加: タイムスタンプ
+  if ((filterDrawer && filterDrawer.style.display === 'block') || 
+      (historyModal && historyModal.classList.contains('show')) ||
+      (aboutModal && aboutModal.classList.contains('show')) ||
+      (photoModal && photoModal.classList.contains('show')) ||
+      (tsModal && tsModal.classList.contains('show'))) {
+    return;
   }
-  titleEl.textContent = customTitle; // タイトルを動的に変更！
-  
-  listContainer.innerHTML = '';
 
-  links.forEach(link => {
-      const lowerLabel = (link.label || "").toLowerCase();
-      const lowerUrl = (link.url || "").toLowerCase();
+  const totalPage = Math.ceil(lastResults.length / pageSize);
+  if (totalPage <= 1) return; // 1ページしかない場合は何もしない
 
-      let serviceClass = 'default';
-      let iconClass = 'fa-solid fa-link';
-
-      if (lowerLabel.includes('instagram') || lowerUrl.includes('instagram.com')) {
-          serviceClass = 'instagram';
-          iconClass = 'fa-brands fa-instagram';
-      } else if (lowerLabel.includes('twitter') || lowerLabel.includes('x') || lowerUrl.includes('twitter.com') || lowerUrl.includes('x.com')) {
-          serviceClass = 'twitter';
-          iconClass = 'fa-brands fa-x-twitter';
-      } else if (lowerLabel.includes('tiktok') || lowerUrl.includes('tiktok.com')) {
-          serviceClass = 'tiktok';
-          iconClass = 'fa-brands fa-tiktok';
-      } else if (lowerLabel.includes('youtube') || lowerUrl.includes('youtube.com') || lowerUrl.includes('youtu.be')) {
-          serviceClass = 'youtube';
-          iconClass = 'fa-brands fa-youtube';
-      } else if (lowerLabel.includes('note') || lowerUrl.includes('note.com')) {
-          serviceClass = 'note';
-          iconClass = 'fa-solid fa-book-open';
-      }
-
-      const li = document.createElement('li');
-      li.innerHTML = `<a href="${link.url}" target="_blank" rel="noopener" class="photo-link-item ${serviceClass}">
-          <i class="${iconClass}"></i>
-          <span>${link.label}</span>
-      </a>`;
-      listContainer.appendChild(li);
-  });
-
-  modal.classList.add('active');
-  modal.onclick = (e) => {
-    if (e.target === modal) modal.classList.remove('active');
-  };
-}
-
-// ★★★ オンショットボタンのクリックイベント ★★★
-document.addEventListener('DOMContentLoaded', () => {
-  const onshotToggle = document.getElementById('onshotToggle');
-  if (onshotToggle) {
-    onshotToggle.addEventListener('click', (e) => {
-      e.preventDefault();
-      if (onshotData && onshotData.length > 0) {
-        openPhotoLinksModal(onshotData, 'スタジオオンショット');
-      } else {
-        alert('現在登録されているオンショットはありません。');
-      }
-    });
+  if (e.key === 'ArrowRight') {
+    // 次のページへ
+    if (currentPage < totalPage) {
+      e.preventDefault(); // デフォルトのスクロール動作を無効化
+      search({ gotoPage: currentPage + 1 });
+      scrollToResultsTop();
+    }
+  } else if (e.key === 'ArrowLeft') {
+    // 前のページへ
+    if (currentPage > 1) {
+      e.preventDefault(); // デフォルトのスクロール動作を無効化
+      search({ gotoPage: currentPage - 1 });
+      scrollToResultsTop();
+    }
   }
-});
-
-
-/* =================================================== */
-/* ★★★ キーボード左右キーによるページネーション操作 ★★★ */
-/* =================================================== */
-document.addEventListener('keydown', function(event) {
-    // 1. 検索ボックスやドロップダウンなどの「入力フォーム」を操作中の場合は無効化
-    const activeEl = document.activeElement;
-    if (activeEl && ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeEl.tagName)) {
-        return;
-    }
-
-    // 2. 詳細フィルター（ドロワー）やモーダルが開いている時も無効化
-    const filterDrawer = document.getElementById('filterDrawer');
-    const isDrawerOpen = filterDrawer && (filterDrawer.style.display === 'block' || filterDrawer.classList.contains('show'));
-    const isModalOpen = document.body.classList.contains('body-scroll-locked') || document.body.classList.contains('modal-open');
-    if (isDrawerOpen || isModalOpen) return;
-
-    // 3. 現在アクティブ（選択中）なページボタンを探す
-    const activeBtn = document.querySelector('#paginationArea .page-btn.active');
-    if (!activeBtn) return; // ページネーションがない場合は何もしない
-
-    // ページネーションエリア内にあるすべてのボタンを取得
-    const allBtns = Array.from(document.querySelectorAll('#paginationArea button'));
-    const activeIndex = allBtns.indexOf(activeBtn);
-
-    // 4. キー入力に応じた処理
-    if (event.key === 'ArrowRight') {
-        // 【右キー】次のページへ
-        // 現在のボタンより「右側」にある、クリック可能な最初のボタンを押す
-        for (let i = activeIndex + 1; i < allBtns.length; i++) {
-            // 無効化されているボタンや、「...」のような省略ボタン(.more-btn)は飛ばす
-            if (!allBtns[i].disabled && !allBtns[i].classList.contains('more-btn')) {
-                allBtns[i].click();
-                break;
-            }
-        }
-    } else if (event.key === 'ArrowLeft') {
-        // 【左キー】前のページへ
-        // 現在のボタンより「左側」にある、クリック可能な最初のボタンを押す
-        for (let i = activeIndex - 1; i >= 0; i--) {
-            if (!allBtns[i].disabled && !allBtns[i].classList.contains('more-btn')) {
-                allBtns[i].click();
-                break;
-            }
-        }
-    }
 });

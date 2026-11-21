@@ -2,84 +2,161 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <!-- Content Security Policy: 想定外のドメインからのスクリプト読込・データ送信をブラウザ側で遮断する。
+       GitHub PagesはHTTPヘッダーを設定できないため<meta>で指定。
+       インラインスクリプト/スタイルを使用しているため 'unsafe-inline' は許可（外部起点の注入は引き続き遮断される）。
+       サムネイルはローカル配信（YouTubeではないため i.ytimg.com は不要）。
+       新しいCDNや外部サービスを追加する時は、ここに該当ドメインを追記すること。 -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://use.typekit.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://use.typekit.net https://p.typekit.net; font-src 'self' data: https://use.typekit.net https://p.typekit.net https://cdnjs.cloudflare.com; img-src 'self' data: https://p.typekit.net https://performance.typekit.net; connect-src 'self' https://use.typekit.net https://p.typekit.net https://performance.typekit.net; object-src 'none'; base-uri 'self'; form-action 'self'">
+  <!-- interactive-widget=resizes-content: キーボード表示時にレイアウトビューポートが縮み、
+       下部固定のタイムスタンプモーダルがブラウザネイティブでキーボード上に配置される。
+       maximum-scale=1 / user-scalable=no: iOSがボタンの素早い2回目タップを
+       ダブルタップズームと解釈してクリックを食べるのを防ぐ（ピンチズームはOS側で許可される）。 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
 
   <script>
     (function() {
       try {
-        const theme = localStorage.getItem("site_theme_v1") || 'light';
+        // このサイトのカラーテーマは ホワイト / ブラック / レッド の3種類のみ
+        let theme = localStorage.getItem("site_theme_v1") || 'light';
+        if (theme !== 'dark' && theme !== 'red') theme = 'light';
         let color = '#f9fafe';
         let statusBarStyle = 'default';
         let bodyBg = '';
-        let ballColor = '';
 
+        /* theme-color(=color)はiOSがステータスバーの背景色に使い、その明るさで
+           時計の文字色(黒/白)を自動決定する。明るいテーマ色をそのまま渡すと黒文字に
+           なってしまうため、ステータスバーには白文字判定になる濃色を渡す。
+           ページ背景(bodyBg)は従来どおり明るいテーマ色のまま。main.js側と同期すること。 */
         switch (theme) {
           case 'dark':
-            color = '#22272e';
+            color = '#000000';
             statusBarStyle = 'black-translucent';
             bodyBg = color;
-            document.documentElement.classList.add('dark-mode'); // ★追加
             break;
           case 'red':
-            color = '#e60046';
+            color = '#8c002b';
             statusBarStyle = 'black-translucent';
-            bodyBg = color;
-            ballColor = '#ffffff';
-            document.documentElement.classList.add('theme-red'); // ★追加
+            bodyBg = '#e60046';
             break;
         }
 
         document.write('<meta name="theme-color" id="theme-color-meta" content="' + color + '">');
         document.write('<meta name="apple-mobile-web-app-status-bar-style" id="status-bar-style" content="' + statusBarStyle + '">');
 
+        /* ダークテーマの起動時白フラッシュ対策: color-scheme を dark に固定して
+           エンジン既定のキャンバス色自体を黒にする */
+        document.write('<meta name="color-scheme" id="color-scheme-meta" content="' + (theme === 'dark' ? 'dark' : 'light') + '">');
+        if (theme === 'dark') {
+          document.documentElement.style.colorScheme = 'dark';
+        }
+
+        // 最初の1フレームから正しい色で塗るため、html要素の背景を即座にインライン指定する。
+        document.documentElement.style.backgroundColor = bodyBg || '#f9fafe';
+
         let styleContent = '';
         if (bodyBg) {
           styleContent += 'html, body, #loading-screen { background-color: ' + bodyBg + ' !important; }';
         }
-        if (ballColor) {
-          styleContent += '.loading-ball { background-color: ' + ballColor + ' !important; }';
-        }
 
-        // CSSファイルの読み込みを待たずに、強制的にロゴを表示状態にします
         styleContent += `
           #loading-screen { opacity: 1 !important; visibility: visible !important; display: flex !important; }
           #loading-logo { opacity: 1 !important; visibility: visible !important; }
         `;
-        // ▲▲▲ ここまで ▲▲▲
-        
+
         if (styleContent) {
           document.write('<style id="early-theme-style">' + styleContent + '</style>');
+        }
+
+        /* ★ローディングロゴの中央固定（iOSホーム画面アプリのみ）:
+           PWA起動直後はビューポート高さが一瞬小さく報告され（例: 780px→844px）、
+           flex中央配置のロゴが数フレーム後に下へジャンプして見えていた。
+           端末の画面高さ(screen.height)は起動前から確定している値なので、
+           ローディング画面の高さをこれに固定すれば最初のフレームから最終位置に置ける。
+           このstyleはテーマ切替で書き換えられるearly-theme-styleとは別タグにする。 */
+        /* ★安全弁: navigator.standalone は macOS Safari の「Dockに追加」アプリでも
+           true になるため、タッチ非対応（maxTouchPoints===0 のMac）は除外する。
+           以前は innerHeight との乖離だけで判定していたが、iOSはこのスクリプトの
+           実行時点（レイアウト前）で innerHeight が未確定(0)のことがあり、
+           肝心のiPhoneで固定がスキップされていた。innerHeight 未確定時は適用し、
+           確定していて大きく乖離している場合（iPad分割画面等）のみ見送る。 */
+        if (navigator.standalone === true && window.screen && screen.height && navigator.maxTouchPoints > 1) {
+          var isLandscape = window.matchMedia && window.matchMedia('(orientation: landscape)').matches;
+          var scrH = isLandscape
+            ? Math.min(screen.width, screen.height)
+            : Math.max(screen.width, screen.height);
+          var ih = window.innerHeight || 0;
+          /* ★ステータスバーが「default」でホーム画面に追加された場合（ライトテーマで追加した時など）、
+             アプリの表示領域はステータスバーの下（例: 393×852の機種で上から59pt）から始まる。
+             ここで画面全体の高さをそのまま使うと、中心がその分だけ下にずれていた。
+             ステータスバーの形式は追加時にiOSが固定するので今のテーマからは判断できない。
+             そこで前回の起動時に main.js が実測した「画面の高さ − 表示領域の高さ」(pwa_top_gap_v1) を使い、
+             ロゴが画面（物理）の真ん中に来るよう、その2倍を高さから差し引く。
+             （横向きはステータスバーが出ないので補正しない）
+             実測値がまだない初回は、今のテーマがライト（=default）なら機種ごとの
+             セーフエリア上端（画面サイズで決まる。393×852で実測59pt）を仮に使う。 */
+          var topGap = 0;
+          if (!isLandscape) {
+            var savedGap = localStorage.getItem('pwa_top_gap_v1');
+            var savedNum = parseFloat(savedGap);
+            if (savedGap !== null && savedNum >= 0 && savedNum <= 120) {
+              topGap = savedNum;
+            } else if (statusBarStyle === 'default') {
+              var gapTable = {
+                '375x667': 20, '414x736': 20,
+                '375x812': 47, '414x896': 47, '390x844': 47, '428x926': 47,
+                '393x852': 59, '430x932': 59,
+                '402x874': 62, '440x956': 62
+              };
+              topGap = gapTable[Math.min(screen.width, screen.height) + 'x' + scrH] || 0;
+            }
+          }
+          if (scrH > 0 && (ih === 0 || Math.abs(scrH - ih) <= 200)) {
+            /* 高さは画面全体のまま（表示領域より必ず大きいので下まで覆える）にし、
+               下側の余白で中身だけを上へ寄せる。高さそのものを縮めると、表示領域の下端との間に
+               隙間ができて裏の一覧が見えていた（::after の延長は contain:paint で描かれない） */
+            document.write('<style id="loading-center-fix">#loading-screen { height: ' + scrH + 'px !important; min-height: 0 !important; box-sizing: border-box !important; padding-bottom: ' + (topGap * 2) + 'px !important; }</style>');
+          }
         }
       } catch (e) {
         console.error("Early theme application failed:", e);
       }
     })();
   </script>
-
   <link rel="preload" as="image" href="logo.webp" type="image/webp">
-  <link rel="preload" as="image" href="logo.png">
-  <title>長谷川育美非公式サイト(検) - 「長谷川育美公式ラジオ(決)」非公式検索エンジン</title>
-  
-  <meta name="color-scheme" content="dark light">
 
-<meta property="og:title" content="長谷川育美非公式サイト(検)" />
+  <title>長谷川育美非公式サイト(検)|「長谷川育美公式ラジオ(決)」非公式検索サイト</title>
+
+  <!-- color-scheme はテーマに応じて先頭のスクリプトが動的に出力する（ダーク起動時の白フラッシュ対策） -->
+
+<meta property="og:title" content="長谷川育美非公式サイト(検)|「長谷川育美公式ラジオ(決)」非公式検索サイト" />
 <meta property="og:description" content="長谷川育美公式ラジオ(決)のエピソードをカテゴリ・コーナー・キーワードなどでサクッと検索。" />
 <meta property="og:type" content="website" />
-<meta property="og:url" content="https://ikumi-searchtheradio.com/" />
-<meta property="og:image" content="https://ikumi-searchtheradio.com/ogp_img.jpg?v=1" />
-
+<meta property="og:url" content="https://searchtheradio.com/hasegawa-ikumi/" />
+<meta property="og:image" content="https://searchtheradio.com/hasegawa-ikumi/ogp_img.jpg?v=1" />
 <meta property="og:image:width" content="1200" />
 <meta property="og:image:height" content="630" />
 
-<meta property="og:site_name" content="長谷川育美非公式サイト(検)" />
+<meta property="og:site_name" content="長谷川育美非公式サイト(検)|「長谷川育美公式ラジオ(決)」非公式検索サイト" />
 <meta property="og:locale" content="ja_JP" />
 
 <meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="長谷川育美非公式サイト(検)" />
+<meta name="twitter:title" content="長谷川育美非公式サイト(検)|「長谷川育美公式ラジオ(決)」非公式検索サイト" />
 <meta name="twitter:description" content="長谷川育美公式ラジオ(決)のエピソードをカテゴリ・コーナー・キーワードなどでサクッと検索。" />
-<meta name="twitter:image" content="https://ikumi-searchtheradio.com/ogp_img.jpg?v=1" />
+<meta name="twitter:image" content="https://searchtheradio.com/hasegawa-ikumi/ogp_img.jpg?v=1" />
 
-<link rel="canonical" href="https://ikumi-searchtheradio.com/" />
+<link rel="canonical" href="https://searchtheradio.com/hasegawa-ikumi/" />
+<!-- Googleの検索結果に表示される「サイト名」の指定（WebSite構造化データ）。
+     Googleはこの name を最優先で使い、使えない場合は alternateName → og:site_name → <title> の順で参照する -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "長谷川育美非公式サイト(検)|「長谷川育美公式ラジオ(決)」非公式検索サイト",
+  "alternateName": ["長谷川育美非公式サイト(検)", "育美ラジオ検"],
+  "url": "https://searchtheradio.com/hasegawa-ikumi/"
+}
+</script>
 <meta name="description" content="長谷川育美公式ラジオ(決)のエピソードをカテゴリ・コーナー・キーワードなどでサクッと検索できる非公式サイト。" />
 
 <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png?v=3">
@@ -89,40 +166,50 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="育美ラジオ検">
 
+<link rel="manifest" href="./site.webmanifest">
 
-<link rel="manifest" href="./site.webmanifest?v=20260422a">
 
-  
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
-<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="preload" as="style" onload="this.onload=null;this.rel='stylesheet'" />
-<noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"></noscript>
+  <!-- SRI(integrity): CDN側でファイルが改ざんされた場合にブラウザが読込を拒否する -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-9ndCyUaIbzAi2FUVXJi0CjmCapSmO7SnpJef0486qhLnuZ2cdeRhO02iuK6FUUVM" crossorigin="anonymous" />
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="preload" as="style"
+      integrity="sha384-PPIZEGYM1v8zp5Py7UjFb79S58UeqCL9pYVnVPURKEqvioPROaVAJKKLzvH2rDnI" crossorigin="anonymous"
+      onload="this.onload=null;this.rel='stylesheet'" />
+<noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+      integrity="sha384-PPIZEGYM1v8zp5Py7UjFb79S58UeqCL9pYVnVPURKEqvioPROaVAJKKLzvH2rDnI" crossorigin="anonymous"></noscript>
 
 <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
-<link rel="preconnect" href="https://code.jquery.com" crossorigin>
-<link rel="preconnect" href="https://i.ytimg.com" crossorigin>
+<!-- Typekit: スクリプト読込(use.typekit.net)とフォント配信への接続を先に張り、Webフォント表示を速める -->
+<link rel="preconnect" href="https://use.typekit.net" crossorigin>
+<link rel="preconnect" href="https://p.typekit.net" crossorigin>
+  <link href="style.css" rel="stylesheet" />
 
-<script>
-  (function(d) {
-    var config = {
-      kitId: 'bmo6cgb',
-      scriptTimeout: 3000,
-      async: true
-    },
-    h=d.documentElement,t=setTimeout(function(){h.className=h.className.replace(/\bwf-loading\b/g,"")+" wf-inactive";},config.scriptTimeout),tk=d.createElement("script"),f=false,s=d.getElementsByTagName("script")[0],a;h.className+=" wf-loading";tk.src='https://use.typekit.net/'+config.kitId+'.js';tk.async=true;tk.onload=tk.onreadystatechange=function(){a=this.readyState;if(f||a&&a!="complete"&&a!="loaded")return;f=true;clearTimeout(t);try{Typekit.load(config)}catch(e){}};s.parentNode.insertBefore(tk,s)
-  })(document);
-</script>
-  <link href="style.css?v=20260422a" rel="stylesheet" />
 
 </head>
 <body>
+  <script>
+    /* テーマクラスの即時付与: body生成直後に付与し、最初の描画からテーマ配色を確定させる */
+    (function () {
+      try {
+        var t = localStorage.getItem('site_theme_v1') || 'light';
+        if (t === 'dark') document.body.classList.add('dark-mode');
+        else if (t === 'red') document.body.classList.add('theme-red');
+      } catch (e) {}
+    })();
+  </script>
 
 <div id="loading-screen" style="position:fixed;z-index:9999;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;">
-  <picture>
-    <source srcset="logo.webp" type="image/webp">
-    <img src="logo.png" alt="logo" id="loading-logo" style="width:420px;max-width:85vw;" decoding="sync">
-  </picture>
+  <img src="logo.webp" alt="logo" id="loading-logo" style="width:420px;max-width:85vw;" decoding="sync">
   <span class="visually-hidden">Loading...</span>
 </div>
+<script>
+  /* ローディング画面が実際に画面へ出た時刻（main.jsの最低表示時間はここから数える）。
+     起動開始から数えると、通信が遅いとき（プレビューのトンネル経由など）は画面が見えた時点で
+     既に時間切れになっており、一瞬でフェードアウトしていた */
+  window.__loadingShownAt = performance.now();
+  requestAnimationFrame(function () { window.__loadingShownAt = performance.now(); });
+</script>
+
 
 
 <button id="theme-toggle-btn" aria-label="テーマ切替"><i class="fa-solid fa-palette"></i></button>
@@ -147,7 +234,7 @@
         <button class="btn" id="filterToggleBtn" type="button" aria-expanded="false" aria-pressed="false" tabindex="0" title="フィルター条件を選択">
           <i class="fa fa-filter"></i>
         </button>
-        
+
         <button class="icon-btn" id="favOnlyToggleBtn" aria-pressed="false" title="お気に入りだけ表示">
   <i class="fa-regular fa-star"></i><span>お気に入り</span>
 </button>
@@ -157,17 +244,21 @@
 </button>
 
 
-        <button class="reset-btn" id="mainResetBtn" onclick="resetSearch()" title="すべてリセット" tabindex="0">リセット</button>
+        <button class="reset-btn" id="mainResetBtn" title="すべてリセット" tabindex="0">リセット</button>
         <span class="sort-wrapper">
           <select id="sortSelect" class="form-select searchbox-select" aria-label="並び替え" title="並び替え">
             <option value="newest">公開日時が新しい順</option>
             <option value="oldest">公開日時が古い順</option>
-            <option value="longest">動画時間が長い順</option>
-            <option value="shortest">動画時間が短い順</option>
+            <option value="longest">再生時間が長い順</option>
+            <option value="shortest">再生時間が短い順</option>
           </select>
         </span>
-        
-        </div>
+
+        <!-- さーち・ざ・らじお！の「再生リスト作成」（YouTube専用）の位置に置く。リンク先は main.js が最新回を設定 -->
+        <a id="latestBtn" class="playlist-btn" href="#" target="_blank" rel="noopener" hidden>
+            <i class="fa-solid fa-headphones"></i> 最新回を聴く
+        </a>
+      </div>
     </div>
 
     <div class="results-count-under-bar" aria-label="検索結果概要">
@@ -178,49 +269,41 @@
   </div>
   <div class="drawer-backdrop" id="drawerBackdrop"></div>
   <div id="filterDrawer" aria-modal="true" role="dialog" aria-label="詳細フィルター">
-    
     <div class="filter-section">
-      <div class="filter-title">📂 カテゴリ検索</div>
-      <div class="filter-grid" id="categoryButtonGroup" role="group" aria-label="カテゴリフィルター">
-        <button class="btn-category" data-category="ラジオ" aria-pressed="false">ラジオ</button>
-        <button class="btn-category" data-category="動画" aria-pressed="false">動画</button>
-        <button class="btn-category" data-category="ゲスト" aria-pressed="false">ゲスト</button>
-        <button class="btn-category" data-category="地上波" aria-pressed="false">地上波</button>
+      <div class="filter-title"><i class="fa-solid fa-folder-open" aria-hidden="true"></i> カテゴリ検索</div>
+      <div id="categoryButtonGroup" class="filter-grid" role="group" aria-label="カテゴリフィルター">
+        <button class="btn-corner" data-category="ラジオ" aria-pressed="false">ラジオ</button>
+        <button class="btn-corner" data-category="動画" aria-pressed="false">動画</button>
+        <button class="btn-corner" data-category="ゲスト" aria-pressed="false">ゲスト</button>
+        <button class="btn-corner" data-category="地上波" aria-pressed="false">地上波</button>
       </div>
     </div>
-
     <div class="filter-section">
-      <div class="filter-title">📅 公開年検索</div>
+      <div class="filter-title"><i class="fa-solid fa-calendar-days" aria-hidden="true"></i> 公開年検索</div>
       <div id="yearButtonGroup" class="filter-grid" role="group" aria-label="公開年フィルター">
-        <button class="btn-year" data-year="2024" aria-pressed="false">2024</button>
-        <button class="btn-year" data-year="2025" aria-pressed="false">2025</button>
-        <button class="btn-year" data-year="2026" aria-pressed="false">2026</button>
-      </div>
-    </div>
-
-    <div class="filter-section">
-      <div class="filter-title">🎬 出演作品名検索</div>
-      <div class="filter-grid" style="display: block; grid-template-columns: none;">
-        <div class="select-wrapper">
-          <select id="worksSelect" class="form-select searchbox-select" style="width: 100%; cursor: pointer;" aria-label="出演作品を選択">
-            <option value="">---</option>
-            </select>
-        </div>
-      </div>
-    </div>
-
-    <div class="filter-section">
-      <div class="filter-title">👤 人物名検索</div>
-      <div class="filter-grid" style="display: block; grid-template-columns: none;">
-        <div class="select-wrapper">
-          <select id="personSelect" class="form-select searchbox-select" style="width: 100%; cursor: pointer;" aria-label="人物を選択">
-            <option value="">---</option>
-          </select>
-        </div>
+        <button class="btn-year" data-year="2024" aria-pressed="false">2024年</button>
+        <button class="btn-year" data-year="2025" aria-pressed="false">2025年</button>
+        <button class="btn-year" data-year="2026" aria-pressed="false">2026年</button>
       </div>
     </div>
     <div class="filter-section">
-      <div class="filter-title">📻 コーナー検索</div>
+      <div class="filter-title"><i class="fa-solid fa-tv" aria-hidden="true"></i> 出演作品名検索</div>
+      <div class="filter-select-wrap">
+        <select id="worksSelect" class="form-select searchbox-select drawer-select" aria-label="出演作品を選択">
+          <option value="">出演作品を選択</option>
+        </select>
+      </div>
+    </div>
+    <div class="filter-section">
+      <div class="filter-title"><i class="fa-solid fa-user" aria-hidden="true"></i> 人物名検索</div>
+      <div class="filter-select-wrap">
+        <select id="personSelect" class="form-select searchbox-select drawer-select" aria-label="人物を選択">
+          <option value="">人物を選択</option>
+        </select>
+      </div>
+    </div>
+    <div class="filter-section">
+      <div class="filter-title"><i class="fa-solid fa-radio" aria-hidden="true"></i> コーナー検索</div>
       <div id="cornerButtonGroup" class="filter-grid" role="group" aria-label="コーナーフィルター">
         <button class="btn-corner" data-corner="長谷川育美資料館" aria-pressed="false">長谷川育美資料館</button>
         <button class="btn-corner" data-corner="フォトメモリー" aria-pressed="false">フォトメモリー</button>
@@ -231,12 +314,11 @@
         <button class="btn-corner" data-corner="長谷川育美、早くあるある聞きたい" aria-pressed="false">長谷川育美、早くあるある聞きたい</button>
         <button class="btn-corner" data-corner="これって私だけ？" aria-pressed="false">これって私だけ？</button>
         <button class="btn-corner" data-corner="お嬢様の仰せのままに" aria-pressed="false">お嬢様の仰せのままに</button>
-        </div>
+      </div>
     </div>
-  
+
     <div class="drawer-footer" role="group" aria-label="フィルター操作">
-      <button id="drawerCloseBtn" type="button" class="drawer-close-btn" title="フィルターを閉じる"
-        onclick="if(window.toggleFilterDrawer){window.toggleFilterDrawer(false);} else if(window.closeDrawer){window.closeDrawer();}">
+      <button id="drawerCloseBtn" type="button" class="drawer-close-btn" title="フィルターを閉じる">
         <i class="fa fa-xmark"></i><span> 閉じる</span>
       </button>
     </div>
@@ -245,14 +327,11 @@
   <div class="main-content" id="mainContent">
     <ul id="results" class="list-unstyled"></ul>
     <div class="pagination-area" id="paginationArea"></div>
-   
+
     <div id="aboutModal" class="modal-overlay">
       <div id="aboutModalContent">
         <button id="aboutCloseBtn"><i class="fa-solid fa-xmark"></i></button>
-        <picture>
-          <source srcset="logo.webp" type="image/webp">
-          <img src="logo.png" alt="logo" class="about-logo"/>
-        </picture>
+        <img src="logo.webp" alt="logo" class="about-logo"/>
         <div class="about-title">このサイトについて</div>
         <div class="about-body">
           <br>
@@ -270,28 +349,87 @@
    <section id="radio-history" class="history-section" aria-label="ラジオの歴史">
   <button class="history-toggle" id="historyToggle"
           aria-haspopup="dialog" aria-expanded="false" aria-controls="historyModal">
-    <span class="icon">📻</span>
     <span class="title">『ラジオの歴史』</span>
+    <i class="fa-solid fa-chevron-right history-toggle-chevron" aria-hidden="true"></i>
   </button>
 
-  <button class="history-toggle" id="onshotToggle" style="margin-top: 12px;">
-    <span class="icon">📷</span>
+  <button class="history-toggle" id="onshotToggle"
+          aria-haspopup="dialog" aria-controls="photoModal">
     <span class="title">『スタジオオンショット』</span>
+    <i class="fa-solid fa-chevron-right history-toggle-chevron" aria-hidden="true"></i>
   </button>
-  <div class="share-buttons" id="shareButtons">
 
   <div class="share-buttons" id="shareButtons">
-    <a id="shareX" class="share-btn" href="#" aria-label="Xでシェア" target="_blank" rel="noopener">
-      <i class="fa-brands fa-x-twitter" aria-hidden="true"></i>
-    </a>
-    <a id="shareLINE" class="share-btn" href="#" aria-label="LINEでシェア" target="_blank" rel="noopener">
-      <i class="fa-brands fa-line" aria-hidden="true"></i>
-    </a>
-    <a id="shareFB" class="share-btn" href="#" aria-label="Facebookでシェア" target="_blank" rel="noopener">
-      <i class="fa-brands fa-facebook" aria-hidden="true"></i>
+    <a id="shareX" class="share-btn" href="#" aria-label="Xにポスト" target="_blank" rel="noopener">
+      <i class="fa-brands fa-x-twitter" aria-hidden="true"></i><span class="share-label">ポスト</span>
     </a>
   </div>
 </section>
+
+<div id="photoModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="photoModalTitle" hidden>
+  <div class="modal-content photo-modal">
+    <div class="modal-header">
+      <h2 id="photoModalTitle" class="modal-title">フォトメモリンク</h2>
+      <button class="modal-close" id="photoCloseBtn" aria-label="閉じる">
+        <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+      </button>
+    </div>
+    <div class="photo-body" id="photoBody">
+      </div>
+  </div>
+</div>
+
+<div id="tsModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="tsModalTitle" hidden>
+  <div class="modal-content ts-modal">
+    <div class="modal-header">
+      <h2 id="tsModalTitle" class="modal-title">タイムスタンプ</h2>
+      <button class="modal-close" id="tsCloseBtn" aria-label="閉じる">
+        <i class="fa-solid fa-xmark" aria-hidden="true"></i>
+      </button>
+    </div>
+    <!-- エピソードカードはヘッダー直下に固定（スクロールしない） -->
+    <ul id="tsEpisodeCard" class="ts-episode-card" hidden></ul>
+    <div class="ts-body">
+      <div class="ts-add-area" hidden>
+        <div class="ts-input-wrap">
+          <textarea id="tsInput" class="ts-input" rows="3" enterkeyhint="enter" autocomplete="off"
+                    aria-label="タイムスタンプとメモを入力（複数行で一括登録できます）"
+                    placeholder="例）3:00 好きなシーン&#10;メモだけでも登録できます"></textarea>
+          <button id="tsCopyBtn" class="ts-copy-btn" aria-label="入力内容をコピー" title="入力内容をコピー">
+            <i class="fa-regular fa-copy"></i>
+          </button>
+        </div>
+        <div id="tsError" class="ts-error" hidden></div>
+        <div class="ts-actions">
+          <button id="tsCancelBtn" class="ts-cancel-btn" hidden>キャンセル</button>
+          <button id="tsAddBtn" class="ts-add-btn" aria-label="タイムスタンプを保存">
+            <i class="fa-solid fa-check"></i><span>保存</span>
+          </button>
+        </div>
+      </div>
+      <ul id="tsList" class="ts-list" aria-label="登録済みタイムスタンプ"></ul>
+    </div>
+    <!-- 下部固定エリア: リストが長くてもボタンとヒントは常に見える -->
+    <div class="ts-footer">
+      <div id="tsListActions" class="ts-list-actions" hidden>
+        <button id="tsEditAllBtn" class="ts-edit-all-btn" aria-label="タイムスタンプを登録・編集">
+          <i class="fa-solid fa-pen"></i><span>編集</span>
+        </button>
+        <button id="tsClearAllBtn" class="ts-clear-all-btn" aria-label="登録済みタイムスタンプをすべて削除">
+          <i class="fa-solid fa-trash-can"></i><span>すべて削除</span>
+        </button>
+      </div>
+      <div id="tsClearConfirm" class="ts-clear-confirm" hidden role="alertdialog" aria-labelledby="tsClearConfirmText">
+        <p id="tsClearConfirmText" class="ts-clear-confirm-text">登録済みのタイムスタンプをすべて削除します。<span class="ts-clear-confirm-q">よろしいですか？</span></p>
+        <div class="ts-clear-confirm-actions">
+          <button id="tsClearCancelBtn" class="ts-clear-cancel-btn">キャンセル</button>
+          <button id="tsClearOkBtn" class="ts-clear-ok-btn"><i class="fa-solid fa-trash-can"></i><span>すべて削除</span></button>
+        </div>
+      </div>
+      <p class="ts-hint">時間をタップするとAuDeeのエピソードページが開きます。<br>（このサイトをホーム画面に追加するとアプリ化し、<br>タイムスタンプを永久に保存できます。）</p>
+    </div>
+  </div>
+</div>
 
 <div id="historyModal" class="modal-overlay" role="dialog" aria-modal="true"
      aria-labelledby="historyModalTitle" hidden aria-label="ラジオの歴史">
@@ -311,48 +449,102 @@
 </div>
 
 <footer class="site-footer">
-  ©TOKYO FM Broadcasting Co., Ltd. All rights reserved.<br>©DWANGO Co., Ltd.<br>
-      <a href="https://x.com/paseri_538" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">Developed by paseri_538</a>
+      ©TOKYO FM Broadcasting Co., Ltd. All rights reserved.<br>©DWANGO Co., Ltd.<br>
+        <a href="https://x.com/paseri_538" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">Developed by paseri_538</a>
       <span class="footer-sep">・</span>
       <a href="#" id="aboutSiteLink" style="color:inherit;text-decoration:underline;">このサイトについて</a>
     </footer>
   </div>
 
-  
-  <script src="main.js?v=20260422a" defer></script>
+  <script>
+  (function(d) {
+    var config = {
+      kitId: 'bmo6cgb',
+      scriptTimeout: 3000,
+      async: true
+    },
+    h=d.documentElement,t=setTimeout(function(){h.className=h.className.replace(/\bwf-loading\b/g,"")+" wf-inactive";},config.scriptTimeout),tk=d.createElement("script"),f=false,s=d.getElementsByTagName("script")[0],a;h.className+=" wf-loading";tk.src='https://use.typekit.net/'+config.kitId+'.js';tk.async=true;tk.onload=tk.onreadystatechange=function(){a=this.readyState;if(f||a&&a!="complete"&&a!="loaded")return;f=true;clearTimeout(t);try{Typekit.load(config)}catch(e){}};s.parentNode.insertBefore(tk,s)
+  })(document);
+</script>
+  <script src="main.js" defer></script>
 
   <script>
   // ---- Service Worker register (network-first) ----
+  // ★バージョン表記はこのファイルには置かない。sw.js の SW_VERSION が唯一の表記。
+  // 更新をアップするときは sw.js の SW_VERSION を書き換えること（値が変わると
+  // 全ファイルが新しいキャッシュに一括で取り直され、自動リロードで反映される）。
+
+  // ★起動時ちらつき対策: SWの更新チェックが決着するまでローディング画面を保持する
+  // （main.js側がこのPromiseを待つ。オフラインや低速回線で起動が止まらないよう上限あり）。
+  var __swSettle;
+  window.__swUpdateSettled = new Promise(function (res) { __swSettle = res; });
+  setTimeout(__swSettle, 4000); // 絶対上限: 更新確認が遅くても起動を止めない
+
   if ('serviceWorker' in navigator) {
+    // 新しいキャッシュへの切り替えが完了したら自動でリロードする
+    let refreshing = false;
+    // 初回訪問時（SWがまだページを制御していない状態）のclaimではリロードしない。
+    var hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', function() {
+      if (refreshing) return;
+      if (!hadController) { hadController = true; return; }
+      refreshing = true;
+      // リロードの明滅対策: 先にスプラッシュカバー（main.js定義）を被せてからリロードする。
+      if (window.__showSplashCover) { try { window.__showSplashCover(); } catch (e) {} }
+      window.location.reload();
+    });
+
     window.addEventListener('load', function () {
-      navigator.serviceWorker.register('/sw.js?20260422a').then(function(reg) {
+      // 既存の登録があればそれを使う（旧版の /sw.js?20260422a 等の登録もそのまま更新される）。
+      // 未登録（初回訪問）のときだけ /sw.js を登録する。
+      navigator.serviceWorker.getRegistration().then(function(existing) {
+        return existing || navigator.serviceWorker.register('sw.js');
+      }).then(function(reg) {
         return navigator.serviceWorker.ready;
       }).then(function(reg) {
         if (reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
         reg.addEventListener('updatefound', function () {
           const nw = reg.installing;
           if (nw) nw.addEventListener('statechange', function () {
-            if (nw.state === 'installed') reg.waiting && reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+            if (nw.state === 'installed') {
+               if (reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+            }
           });
         });
-      }).catch(console.error);
+
+        // 更新チェックの決着を明示的に待つ:
+        //  - 初回訪問（controllerなし）は更新リロードが起きないため即決着
+        //  - 更新なし → 即決着（ローディングは通常どおり終了）
+        //  - 更新あり → installed→SKIP_WAITING→controllerchangeでリロードされるので
+        //    ここでは決着させず、ローディング画面のまま新バージョンで再起動する
+        if (!hadController) { __swSettle(); }
+        reg.update().catch(function () {}).then(function () {
+          var w = reg.installing || reg.waiting;
+          if (!w) { __swSettle(); return; }
+          w.addEventListener('statechange', function () {
+            if (w.state === 'redundant') __swSettle(); // 更新失敗時は通常起動
+          });
+        });
+
+        // サムネイルの事前キャッシュ（オフライン用）は、初回描画と帯域を
+        // 奪い合わないよう、描画が落ち着いた頃合いにSWへ依頼する。
+        setTimeout(function () {
+          if (reg.active) reg.active.postMessage({ type: 'PRECACHE_THUMBS' });
+        }, 6000);
+      }).catch(function (e) { __swSettle(); console.error(e); });
     });
+  } else {
+    __swSettle();
   }
   </script>
+
+
 <div id="floating-theme-panel" class="floating-panel">
   <button class="theme-btn" data-theme="light" title="ライトテーマ" style="background-color: #f9fafe;"></button>
   <button class="theme-btn" data-theme="dark" title="ダークテーマ" style="background-color: #22272e;"></button>
   <button class="theme-btn" data-theme="red" title="レッドテーマ" style="background-color: #e60046;"></button>
 </div>
 
-<div id="photo-links-modal">
-  <div class="photo-links-content">
-    <button class="close-modal-btn" aria-label="閉じる" onclick="document.getElementById('photo-links-modal').classList.remove('active')">
-      <i class="fa-solid fa-xmark"></i>
-    </button>
-    <ul id="photo-links-list"></ul>
-  </div>
-</div>
 
 </body>
 </html>
